@@ -2,7 +2,7 @@
 
 Raspberry Pi gateway and ESP32 WROVER firmware for industrial telemetry.
 
-The frontend runs on Vercel. The API and singleton telemetry/notification worker run on the Oracle VM alongside BaSyx; see the [Oracle deployment guide](https://github.com/DruHustle/smart-factory-iot-frontend/blob/oracle-migration/deploy/oracle/README.md). Oracle releases and Pi updates are currently manual. The historical Render release workflow is disabled. Edge quality CI validates pull requests targeting `master` and pushes to `master`; CI never flashes plant hardware.
+The frontend runs on Vercel. The API and singleton telemetry/notification worker run on the Oracle VM alongside BaSyx; see the [Oracle deployment guide](https://github.com/DruHustle/smart-factory-iot-frontend/blob/main/deploy/oracle/README.md). Oracle releases and Pi updates are currently manual. The historical Render release workflow is disabled. Edge quality CI validates pull requests targeting `master` and pushes to `master`; CI never flashes plant hardware.
 
 ## Data path
 
