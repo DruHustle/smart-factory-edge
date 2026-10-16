@@ -25,6 +25,18 @@ def _install_dotenv_stub() -> None:
 
 
 class GatewayConfigurationTests(unittest.TestCase):
+    def test_telemetry_intervals_leave_headroom_for_dashboard_offline_timeout(self):
+        _purge_modules("config")
+        with patch.dict("os.environ", {"EDGE_ENV": "development"}, clear=True):
+            from config import load_settings
+            self.assertEqual(load_settings().heartbeat_interval_seconds, 60)
+            self.assertEqual(load_settings().telemetry_snapshot_seconds, 60)
+        for name in ("HEARTBEAT_INTERVAL_SECONDS", "TELEMETRY_SNAPSHOT_SECONDS"):
+            for value in ("0", "121"):
+                with patch.dict("os.environ", {"EDGE_ENV": "development", name: value}, clear=True):
+                    with self.assertRaisesRegex(RuntimeError, "between 1 and 60"):
+                        load_settings()
+
     def test_asset_polling_defaults_to_subsecond_for_motion_telemetry(self):
         _purge_modules("config")
         with patch.dict("os.environ", {"EDGE_ENV": "development"}, clear=True):
@@ -40,6 +52,11 @@ class FakeMqttClient:
         self.loop_started = False
         self.loop_stopped = False
         self.disconnected = False
+        self.acknowledged = []
+
+    def ack(self, mid, qos):
+        self.acknowledged.append((mid, qos))
+        return 0
 
     def username_pw_set(self, *_args, **_kwargs):
         pass
@@ -71,6 +88,7 @@ def _install_paho_stub() -> None:
     client_mod = types.ModuleType("paho.mqtt.client")
     client_mod.Client = lambda *args, **kwargs: FakeMqttClient()
     client_mod.MQTT_ERR_SUCCESS = 0
+    client_mod.CallbackAPIVersion = types.SimpleNamespace(VERSION2=2)
 
     mqtt_mod = types.ModuleType("paho.mqtt")
     mqtt_mod.client = client_mod
@@ -384,6 +402,47 @@ class GatewaySmokeTests(unittest.TestCase):
         local = sensor_gateway.make_local_mqtt_client(settings, cloud)
         local.on_connect(local, None, None, 0)
         self.assertEqual(local.subscribed, ["factory/factory-a/line-1/+/telemetry", "factory/factory-a/line-1/+/heartbeat"])
+
+    def test_local_ack_waits_for_durable_acceptance_and_failure_requests_restart(self):
+        gateway = importlib.import_module("sensor_gateway")
+        settings = types.SimpleNamespace(local_mqtt_client_id="test", local_mqtt_username="", local_mqtt_use_tls=False,
+            site_id="factory-a", line_id="line-1", local_mqtt_device_ids=("esp32-wrover-01",), device_id="pi-edge-01")
+        cloud = FakeMqttClient()
+        cloud.publish = lambda *a, **kw: types.SimpleNamespace(rc=1)
+        local = gateway.make_local_mqtt_client(settings, cloud)
+        msg = types.SimpleNamespace(topic="factory/factory-a/line-1/esp32-wrover-01/telemetry", mid=42, qos=1,
+            payload=json.dumps({"deviceId": "esp32-wrover-01", "timestamp": 1800000000000, "temperature": 20}).encode())
+        local.on_message(local, None, msg)
+        self.assertEqual(local.acknowledged, [])
+        self.assertTrue(gateway.STOP.is_set())
+        self.assertTrue(gateway.INGRESS_FAILED.is_set())
+
+    def test_local_ack_accepts_durable_and_permanently_invalid_messages(self):
+        gateway = importlib.import_module("sensor_gateway")
+        settings = types.SimpleNamespace(local_mqtt_client_id="test", local_mqtt_username="", local_mqtt_use_tls=False,
+            site_id="factory-a", line_id="line-1", local_mqtt_device_ids=("esp32-wrover-01",), device_id="pi-edge-01")
+        cloud = FakeMqttClient()
+        local = gateway.make_local_mqtt_client(settings, cloud)
+        msg = types.SimpleNamespace(topic="factory/factory-a/line-1/esp32-wrover-01/telemetry", mid=42, qos=1,
+            payload=json.dumps({"deviceId": "esp32-wrover-01", "timestamp": 1800000000000, "temperature": 20}).encode())
+        local.on_message(local, None, msg)
+        self.assertEqual(len(cloud.published), 1)
+        self.assertEqual(local.acknowledged, [(42, 1)])
+        msg.mid = 43
+        msg.payload = b"invalid-json"
+        local.on_message(local, None, msg)
+        self.assertEqual(local.acknowledged, [(42, 1), (43, 1)])
+        self.assertFalse(gateway.INGRESS_FAILED.is_set())
+
+    def test_gateway_does_not_queue_heartbeats_while_disconnected(self):
+        gateway = importlib.import_module("sensor_gateway")
+        client = FakeMqttClient()
+        settings = types.SimpleNamespace(device_id="pi-edge-01", site_id="a", line_id="b", heartbeat_interval_seconds=60)
+        for connected in (False, True):
+            gateway.STOP = OneShotStop()
+            client.is_connected = lambda: connected
+            gateway.heartbeat_loop(settings, client)
+        self.assertEqual(len(client.published), 1)
 
     def test_synthetic_telemetry_published_when_serial_disabled(self):
         fake_client, settings, sensor_gateway = self._run_gateway_once(serial_enabled=False)
