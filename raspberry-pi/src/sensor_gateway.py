@@ -19,6 +19,7 @@ from asset_adapters import (
 from ada031_control import Ada031SerialCommandManager, validate_command as validate_ada031_command
 from config import load_settings
 from durable_state import DurableState, DurablePublisher
+from telemetry_policy import TelemetryPolicy
 
 try:
     import serial  # type: ignore
@@ -27,6 +28,7 @@ except Exception:  # pragma: no cover
 
 
 STOP = Event()
+INGRESS_FAILED = Event()
 MAX_EPOCH_MILLISECONDS = 9_223_372_036_854_775_807
 WROVER_CONTROL_PINS = {18}
 GPIO_COMMAND_FIELDS = {"schemaVersion", "action", "commandId", "targetDeviceId", "pin", "value", "holdMs", "expiresAt"}
@@ -121,7 +123,11 @@ def _valid_local_payload(topic: str, payload: bytes, settings) -> bool:
     return True
 
 
-def forward_local_message(settings, cloud_client, msg) -> bool:
+class LocalDeliveryError(RuntimeError):
+    """A valid local message has not yet reached durable gateway storage."""
+
+
+def forward_local_message(settings, cloud_client, msg, policy=None) -> bool:
     """Forward a validated WROVER message without exposing the cloud broker to it."""
     if not _valid_local_payload(msg.topic, msg.payload, settings):
         print("[LOCAL MQTT] rejected message (identity, topic, size, or payload validation failed)")
@@ -131,10 +137,18 @@ def forward_local_message(settings, cloud_client, msg) -> bool:
     if gateway_id:
         payload["gatewayId"] = gateway_id
     forwarded_payload = json.dumps(payload, separators=(",", ":"))
+    payload_bytes = len(forwarded_payload.encode("utf-8"))
+    if policy is not None and not policy.should_forward(msg.topic, payload):
+        policy.accepted(msg.topic, payload, payload_bytes, forwarded=False)
+        policy.report_if_due()
+        return True
     result = cloud_client.publish(msg.topic, forwarded_payload, qos=1, retain=False)
     if getattr(result, "rc", 0) != getattr(mqtt, "MQTT_ERR_SUCCESS", 0):
         print(f"[LOCAL MQTT] upstream queue rejected message on {msg.topic}")
-        return False
+        raise LocalDeliveryError("Durable queue rejected local telemetry")
+    if policy is not None:
+        policy.accepted(msg.topic, payload, payload_bytes, forwarded=True)
+        policy.report_if_due()
     print(f"[LOCAL MQTT] telemetry queued -> {msg.topic}")
     return True
 
@@ -222,18 +236,23 @@ def forward_local_control_ack(settings, cloud_client, msg) -> bool:
         qos=1,
         retain=False,
     )
-    return getattr(result, "rc", 0) == getattr(mqtt, "MQTT_ERR_SUCCESS", 0)
+    if getattr(result, "rc", 0) != getattr(mqtt, "MQTT_ERR_SUCCESS", 0):
+        raise LocalDeliveryError("Durable queue rejected local control acknowledgement")
+    return True
 
 
 def make_local_mqtt_client(settings, cloud_client):
     """Create the local-only WROVER ingress client; this client never has cloud credentials."""
-    client = mqtt.Client(client_id=settings.local_mqtt_client_id, clean_session=False)
+    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                         client_id=settings.local_mqtt_client_id, clean_session=False, manual_ack=True)
+    policy = TelemetryPolicy(getattr(settings, "telemetry_coalescing_enabled", True),
+                             getattr(settings, "telemetry_snapshot_seconds", 60))
     if settings.local_mqtt_username:
         client.username_pw_set(settings.local_mqtt_username, settings.local_mqtt_password)
     if settings.local_mqtt_use_tls:
         client.tls_set(ca_certs=settings.local_mqtt_ca_cert or None)
 
-    def on_connect(_client, _userdata, _flags, rc):
+    def on_connect(_client, _userdata, _flags, rc, _properties=None):
         if rc == 0:
             _client.subscribe(f"factory/{settings.site_id}/{settings.line_id}/+/telemetry", qos=1)
             _client.subscribe(f"factory/{settings.site_id}/{settings.line_id}/+/heartbeat", qos=1)
@@ -244,11 +263,19 @@ def make_local_mqtt_client(settings, cloud_client):
             print(f"[LOCAL MQTT] broker connection failed rc={rc}")
 
     def on_message(_client, _userdata, msg):
-        if msg.topic.endswith("/control-ack"):
-            if not forward_local_control_ack(settings, cloud_client, msg):
-                print("[LOCAL MQTT] rejected or failed to forward WROVER control acknowledgement")
-        else:
-            forward_local_message(settings, cloud_client, msg)
+        try:
+            if msg.topic.endswith("/control-ack"):
+                if not forward_local_control_ack(settings, cloud_client, msg):
+                    print("[LOCAL MQTT] rejected invalid WROVER control acknowledgement")
+            else:
+                forward_local_message(settings, cloud_client, msg, policy)
+            # Invalid payloads are permanent rejects. Valid messages are ACKed
+            # only after durable queuing or intentional policy suppression.
+            _client.ack(msg.mid, msg.qos)
+        except Exception as error:
+            print(f"[LOCAL MQTT] delivery failed ({type(error).__name__}); restarting without acknowledging")
+            INGRESS_FAILED.set()
+            STOP.set()
 
     client.on_connect = on_connect
     client.on_message = on_message
@@ -256,7 +283,8 @@ def make_local_mqtt_client(settings, cloud_client):
 
 
 def make_mqtt_client(settings, apply_configuration=None, relay_control=None, relay_ada031_control=None):
-    client = mqtt.Client(client_id=settings.mqtt_client_id, clean_session=False)
+    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                         client_id=settings.mqtt_client_id, clean_session=False)
     if settings.mqtt_username:
         client.username_pw_set(settings.mqtt_username, settings.mqtt_password)
     if settings.mqtt_use_tls:
@@ -264,7 +292,7 @@ def make_mqtt_client(settings, apply_configuration=None, relay_control=None, rel
 
     expected_topic = command_topic(settings.site_id, settings.line_id, settings.device_id)
 
-    def on_connect(_client, _userdata, _flags, rc):
+    def on_connect(_client, _userdata, _flags, rc, _properties=None):
         if rc == 0:
             print("[MQTT] connected")
             _client.subscribe(expected_topic, qos=1)
@@ -446,8 +474,10 @@ def heartbeat_loop(settings, client):
             "timestamp": int(datetime.now(tz=timezone.utc).timestamp() * 1000),
             "status": "online",
         }
-        client.publish(heartbeat_topic(settings.site_id, settings.line_id, settings.device_id), json.dumps(payload), qos=1)
-        STOP.wait(settings.publish_interval_seconds)
+        # Current liveness is ephemeral: do not spool old heartbeats for replay.
+        if client.is_connected():
+            client.publish(heartbeat_topic(settings.site_id, settings.line_id, settings.device_id), json.dumps(payload, separators=(",", ":")), qos=1)
+        STOP.wait(getattr(settings, "heartbeat_interval_seconds", 60))
 
 
 def main():
@@ -558,7 +588,7 @@ def main():
     hb_thread = Thread(target=heartbeat_loop, args=(settings, client), daemon=True)
     hb_thread.start()
 
-    print(f"[EDGE] gateway started; configured assets: {len(asset_connections)}")
+    print(f"[EDGE] gateway started; configured assets: {len(asset_connections)}; telemetry coalescing: {getattr(settings, 'telemetry_coalescing_enabled', True)}; snapshot/heartbeat seconds: {getattr(settings, 'telemetry_snapshot_seconds', 60)}/{getattr(settings, 'heartbeat_interval_seconds', 60)}")
     while not STOP.is_set():
         if settings.synthetic_telemetry_enabled and not settings.serial_enabled and not asset_connections:
             synthetic = {
@@ -592,6 +622,8 @@ def main():
     if state and not any(getattr(worker, "is_alive", lambda: False)() for worker in workers):
         state.close()
     print("[EDGE] gateway stopped")
+    if INGRESS_FAILED.is_set():
+        raise LocalDeliveryError("Local ingress stopped before durable acceptance; supervisor must retry")
 
 
 if __name__ == "__main__":

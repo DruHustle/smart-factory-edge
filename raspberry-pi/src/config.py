@@ -50,6 +50,9 @@ class Settings:
     environment: str = "development"
     state_dir: str = ""
     max_queued_messages: int = 50000
+    telemetry_coalescing_enabled: bool = True
+    telemetry_snapshot_seconds: int = 60
+    heartbeat_interval_seconds: int = 60
 
 
 def load_settings() -> Settings:
@@ -90,6 +93,9 @@ def load_settings() -> Settings:
         environment=os.getenv("EDGE_ENV", "development").strip().lower(),
         state_dir=os.getenv("EDGE_STATE_DIR", "/var/lib/smart-factory-iot" if os.getenv("EDGE_ENV") == "production" else ""),
         max_queued_messages=int(os.getenv("MAX_QUEUED_MESSAGES", "50000")),
+        telemetry_coalescing_enabled=_as_bool(os.getenv("TELEMETRY_COALESCING_ENABLED"), True),
+        telemetry_snapshot_seconds=int(os.getenv("TELEMETRY_SNAPSHOT_SECONDS", "60")),
+        heartbeat_interval_seconds=int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "60")),
         # Generic line-delimited serial ingest is opt-in. AAS serial profiles
         # have their own exclusive owner and must never race a default tty path.
         serial_enabled=_as_bool(os.getenv("SERIAL_ENABLED"), False),
@@ -106,6 +112,10 @@ def load_settings() -> Settings:
         raise RuntimeError("MQTT identities must be safe topic segments")
     if settings.publish_interval_seconds < 1 or settings.asset_poll_interval_seconds <= 0 or settings.max_queued_messages < 1:
         raise RuntimeError("Polling intervals and delivery queue capacity must be positive")
+    # The application considers devices offline after 120 seconds. Leave room
+    # for network delay and a missed publish without changing that contract.
+    if not 1 <= settings.telemetry_snapshot_seconds <= 60 or not 1 <= settings.heartbeat_interval_seconds <= 60:
+        raise RuntimeError("Telemetry snapshots and heartbeats must be between 1 and 60 seconds")
     if settings.environment == "production":
         if not settings.state_dir or settings.synthetic_telemetry_enabled:
             raise RuntimeError("Production requires durable EDGE_STATE_DIR and disables synthetic telemetry")
