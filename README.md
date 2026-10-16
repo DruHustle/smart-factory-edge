@@ -2,7 +2,7 @@
 
 Raspberry Pi gateway and ESP32 WROVER firmware for industrial telemetry.
 
-Cloud production releases are coordinated from the dashboard repository: a protected dashboard `main` push resolves this repository's `master` branch to an immutable revision, validates the gateway and firmware, deploys one combined backend image to Render, then deploys the separate static frontend artifact to Vercel. Edge quality CI runs on `master`; CI never flashes plant hardware.
+The frontend runs on Vercel. The API and singleton telemetry/notification worker run on the Oracle VM alongside BaSyx; see the [Oracle deployment guide](https://github.com/DruHustle/smart-factory-iot-frontend/blob/oracle-migration/deploy/oracle/README.md). Oracle releases and Pi updates are currently manual. The historical Render release workflow is disabled. Edge quality CI validates pull requests targeting `master` and pushes to `master`; CI never flashes plant hardware.
 
 ## Data path
 
@@ -15,7 +15,7 @@ The Pi polls OPC UA, Modbus TCP/RTU, and serial JSON equipment, exchanges allowl
 - [ADA031 V4 robotic-arm firmware](robotic-arm/README.md): Arduino Uno controller source, calibrated poses, build, and upload instructions.
 - [ESP32 WROVER firmware](esp32-wrover/README.md): configure, build, flash, TLS trust, and broker ACLs.
 
-Production Pi runs as unprivileged `smartfactory`, with secrets under `/etc/smart-factory-iot/`. The Pi hosts Mosquitto for local sensors and uses a dedicated identity for the TLS CloudAMQP telemetry uplink. Backend services use separate scoped CloudAMQP identities for consuming telemetry, publishing gateway commands, and event-bus traffic. Raspberry Pi updates use staged `rsync` without `--delete`, excluding secrets and the virtual environment. ESP32 firmware uses TLS with the Pi broker certificate and unique local credentials. It publishes QoS 1 telemetry to the Pi; the persistent local MQTT session queues messages during short gateway process restarts. Modbus TCP is plaintext in this adapter; keep it on an isolated OT network or authenticated encrypted tunnel.
+Production Pi runs as unprivileged `smartfactory`, with secrets under `/etc/smart-factory-iot/`. The Pi hosts Mosquitto for local sensors and uses a dedicated identity for the TLS CloudAMQP telemetry uplink. Backend services use separate scoped CloudAMQP identities for consuming telemetry, publishing gateway commands, and event-bus traffic. The telemetry release installer stages a separate source tree and virtual environment, checks pinned dependencies and gateway tests under the service account, then switches systemd with a rollback script. Existing secrets, firmware and delivery queues remain in place. See the [gateway guide](raspberry-pi/README.md#telemetry-efficiency-and-recovery) for coalescing, acknowledgements and traffic counters. ESP32 firmware uses TLS with the Pi broker certificate and unique local credentials. It publishes QoS 1 telemetry to the Pi; the persistent local MQTT session queues messages during short gateway process restarts. Modbus TCP is plaintext in this adapter; keep it on an isolated OT network or authenticated encrypted tunnel.
 
 ## Tests and firmware upload
 
