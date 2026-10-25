@@ -41,3 +41,8 @@ Test with a staging broker and bench equipment before a plant rollout.
 This edge release has no automated OTA/FOTA agent. The ESP-WROVER firmware has no network update receiver and must be built and flashed over USB using PlatformIO. Raspberry Pi software uses the staged, manual `rsync` deployment procedure in [the gateway guide](raspberry-pi/README.md); it is not updated by the dashboard. The ADA031 V4 Uno is programmed over USB with the project's connected firmware (the official stock sketch remains a deliberate legacy option). The dashboard marks firmware delivery unavailable and its legacy records must not be treated as device update evidence.
 
 Do not enable remote firmware delivery until a signed release pipeline, hardware compatibility checks, authenticated device acknowledgements, rollback/recovery behavior, and staged rollout tests are in place.
+
+
+### Classified equipment observations
+
+The existing Pi-local relay optionally preserves an `integration` provenance object, including explicit live/simulated/replay mode, UTC receipt time and run identity. Simulated/replay messages require their run IDs. Broker retained state is preserved and cannot be cleared by a payload assertion. The relay does not manufacture a live classification for legacy sources. Original observation time and provenance survive the existing durable queue. No Onesa account, server, SDK or additional poller is needed; native equipment visualization is owned by the Smart Factory dashboard.

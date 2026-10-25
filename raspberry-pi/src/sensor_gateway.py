@@ -81,9 +81,19 @@ def _valid_local_payload(topic: str, payload: bytes, settings) -> bool:
     if kind == "heartbeat":
         return set(record) == {"deviceId", "timestamp", "status"} and record.get("status") in {"online", "offline"}
 
-    allowed = {"deviceId", "timestamp", "temperature", "humidity", "vibration", "power", "pressure", "rpm", "sensorType", "sensorStatus", "assetId", "assetSignals"}
+    allowed = {"deviceId", "timestamp", "temperature", "humidity", "vibration", "power", "pressure", "rpm", "sensorType", "sensorStatus", "assetId", "assetSignals", "integration"}
     if any(key not in allowed for key in record):
         return False
+    integration = record.get("integration")
+    if integration is not None:
+        if not isinstance(integration, dict) or integration.get("mode") not in {"live", "simulated", "replay"}:
+            return False
+        if integration["mode"] == "simulated" and not integration.get("scenarioRunId"):
+            return False
+        if integration["mode"] == "replay" and not integration.get("replayRunId"):
+            return False
+        if not isinstance(integration.get("gatewayReceivedAt"), str):
+            return False
     for key in {"temperature", "humidity", "vibration", "power", "pressure", "rpm"} & record.keys():
         value = record[key]
         if value is not None and not _finite_number(value):
@@ -136,6 +146,10 @@ def forward_local_message(settings, cloud_client, msg, policy=None) -> bool:
     gateway_id = getattr(settings, "device_id", "")
     if gateway_id:
         payload["gatewayId"] = gateway_id
+    if isinstance(payload.get("integration"), dict):
+        # Preserve acquisition classification and observation time. Broker retained
+        # state cannot be cleared by a publisher's payload assertion.
+        payload["integration"]["retained"] = bool(getattr(msg, "retain", False) or payload["integration"].get("retained", False))
     forwarded_payload = json.dumps(payload, separators=(",", ":"))
     payload_bytes = len(forwarded_payload.encode("utf-8"))
     if policy is not None and not policy.should_forward(msg.topic, payload):
@@ -346,6 +360,9 @@ def parse_serial_line(line: str) -> dict:
     record = json.loads(line)
     if "timestamp" not in record:
         record["timestamp"] = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        if isinstance(record.get("integration"), dict):
+            record["integration"]["timestampOrigin"] = "gateway"
+            record["integration"].setdefault("gatewayReceivedAt", datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"))
     return record
 
 
