@@ -20,6 +20,7 @@ from ada031_control import Ada031SerialCommandManager, validate_command as valid
 from config import load_settings
 from durable_state import DurableState, DurablePublisher
 from telemetry_policy import TelemetryPolicy
+from provenance import normalize_provenance
 
 try:
     import serial  # type: ignore
@@ -58,7 +59,7 @@ def command_topic(site_id: str, line_id: str, device_id: str) -> str:
 
 def _valid_local_payload(topic: str, payload: bytes, settings) -> bool:
     """Accept only bounded telemetry from configured sensor identities and topics."""
-    if len(payload) > 4096:
+    if len(payload) > 16 * 1024:
         return False
     parts = topic.split("/")
     if len(parts) != 5 or parts[0] != "factory":
@@ -84,16 +85,10 @@ def _valid_local_payload(topic: str, payload: bytes, settings) -> bool:
     allowed = {"deviceId", "timestamp", "temperature", "humidity", "vibration", "power", "pressure", "rpm", "sensorType", "sensorStatus", "assetId", "assetSignals", "integration"}
     if any(key not in allowed for key in record):
         return False
-    integration = record.get("integration")
-    if integration is not None:
-        if not isinstance(integration, dict) or integration.get("mode") not in {"live", "simulated", "replay"}:
-            return False
-        if integration["mode"] == "simulated" and not integration.get("scenarioRunId"):
-            return False
-        if integration["mode"] == "replay" and not integration.get("replayRunId"):
-            return False
-        if not isinstance(integration.get("gatewayReceivedAt"), str):
-            return False
+    try:
+        normalize_provenance(record.get("integration"))
+    except ValueError:
+        return False
     for key in {"temperature", "humidity", "vibration", "power", "pressure", "rpm"} & record.keys():
         value = record[key]
         if value is not None and not _finite_number(value):
@@ -147,6 +142,7 @@ def forward_local_message(settings, cloud_client, msg, policy=None) -> bool:
     if gateway_id:
         payload["gatewayId"] = gateway_id
     if isinstance(payload.get("integration"), dict):
+        payload["integration"] = normalize_provenance(payload["integration"])
         # Preserve acquisition classification and observation time. Broker retained
         # state cannot be cleared by a publisher's payload assertion.
         payload["integration"]["retained"] = bool(getattr(msg, "retain", False) or payload["integration"].get("retained", False))
