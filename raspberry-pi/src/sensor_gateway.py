@@ -353,12 +353,18 @@ def make_mqtt_client(settings, apply_configuration=None, relay_control=None, rel
 
 
 def parse_serial_line(line: str) -> dict:
+    if len(line.encode("utf-8")) > 16*1024:
+        raise ValueError("invalid_telemetry:bytes")
     record = json.loads(line)
+    if not isinstance(record,dict):
+        raise ValueError("invalid_telemetry:object")
     if "timestamp" not in record:
         record["timestamp"] = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
         if isinstance(record.get("integration"), dict):
             record["integration"]["timestampOrigin"] = "gateway"
             record["integration"].setdefault("gatewayReceivedAt", datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"))
+    if "integration" in record:
+        record["integration"] = normalize_provenance(record["integration"])
     return record
 
 
