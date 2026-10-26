@@ -20,6 +20,7 @@ from ada031_control import Ada031SerialCommandManager, validate_command as valid
 from config import load_settings
 from durable_state import DurableState, DurablePublisher
 from telemetry_policy import TelemetryPolicy
+from provenance import normalize_provenance
 
 try:
     import serial  # type: ignore
@@ -58,7 +59,7 @@ def command_topic(site_id: str, line_id: str, device_id: str) -> str:
 
 def _valid_local_payload(topic: str, payload: bytes, settings) -> bool:
     """Accept only bounded telemetry from configured sensor identities and topics."""
-    if len(payload) > 4096:
+    if len(payload) > 16 * 1024:
         return False
     parts = topic.split("/")
     if len(parts) != 5 or parts[0] != "factory":
@@ -81,8 +82,12 @@ def _valid_local_payload(topic: str, payload: bytes, settings) -> bool:
     if kind == "heartbeat":
         return set(record) == {"deviceId", "timestamp", "status"} and record.get("status") in {"online", "offline"}
 
-    allowed = {"deviceId", "timestamp", "temperature", "humidity", "vibration", "power", "pressure", "rpm", "sensorType", "sensorStatus", "assetId", "assetSignals"}
+    allowed = {"deviceId", "timestamp", "temperature", "humidity", "vibration", "power", "pressure", "rpm", "sensorType", "sensorStatus", "assetId", "assetSignals", "integration"}
     if any(key not in allowed for key in record):
+        return False
+    try:
+        normalize_provenance(record.get("integration"))
+    except ValueError:
         return False
     for key in {"temperature", "humidity", "vibration", "power", "pressure", "rpm"} & record.keys():
         value = record[key]
@@ -136,6 +141,11 @@ def forward_local_message(settings, cloud_client, msg, policy=None) -> bool:
     gateway_id = getattr(settings, "device_id", "")
     if gateway_id:
         payload["gatewayId"] = gateway_id
+    if isinstance(payload.get("integration"), dict):
+        payload["integration"] = normalize_provenance(payload["integration"])
+        # Preserve acquisition classification and observation time. Broker retained
+        # state cannot be cleared by a publisher's payload assertion.
+        payload["integration"]["retained"] = bool(getattr(msg, "retain", False) or payload["integration"].get("retained", False))
     forwarded_payload = json.dumps(payload, separators=(",", ":"))
     payload_bytes = len(forwarded_payload.encode("utf-8"))
     if policy is not None and not policy.should_forward(msg.topic, payload):
@@ -343,9 +353,18 @@ def make_mqtt_client(settings, apply_configuration=None, relay_control=None, rel
 
 
 def parse_serial_line(line: str) -> dict:
+    if len(line.encode("utf-8")) > 16*1024:
+        raise ValueError("invalid_telemetry:bytes")
     record = json.loads(line)
+    if not isinstance(record,dict):
+        raise ValueError("invalid_telemetry:object")
     if "timestamp" not in record:
         record["timestamp"] = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        if isinstance(record.get("integration"), dict):
+            record["integration"]["timestampOrigin"] = "gateway"
+            record["integration"].setdefault("gatewayReceivedAt", datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"))
+    if "integration" in record:
+        record["integration"] = normalize_provenance(record["integration"])
     return record
 
 
