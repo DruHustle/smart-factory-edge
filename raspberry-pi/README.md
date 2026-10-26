@@ -209,3 +209,7 @@ The systemd unit creates `/var/lib/smart-factory-iot` with mode 0700 using `Stat
 The same private database reserves ADA031 command IDs before serial writes. Replayed IDs cannot reopen the controller or cause another jog after a process restart. Reservation happens before USB-open because opening the port can itself trigger the vendor startup pose. A crash between reservation and write is an ambiguous result: inspect the equipment instead of blindly retrying movement. Protocol control remains subject to the commissioned allowlist, expiry and rate limit.
 
 The dashboard repository also provides `pnpm e2e:system`: a disposable real-service MQTT/telemetry test with simulated serial hardware. Run it from a Python environment containing the edge dependencies. Bench commissioning, power-cut recovery, cloud ACL/TLS testing and OTA acceptance remain separate physical/deployment checks.
+
+## Optional security observation
+
+The disabled-by-default [passive collector](../docs/cybersecurity-collector.md) uses the existing durable SQLite file and established connections. It adds no scan, subscriber or plant remediation. Follow the staging/manual commissioning and quarantine/retry procedure before enabling it on hardware.
