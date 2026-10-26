@@ -21,6 +21,7 @@ from config import load_settings
 from durable_state import DurableState, DurablePublisher
 from telemetry_policy import TelemetryPolicy
 from provenance import normalize_provenance
+from security_collector import SecurityCollector
 
 try:
     import serial  # type: ignore
@@ -135,6 +136,10 @@ class LocalDeliveryError(RuntimeError):
 def forward_local_message(settings, cloud_client, msg, policy=None) -> bool:
     """Forward a validated WROVER message without exposing the cloud broker to it."""
     if not _valid_local_payload(msg.topic, msg.payload, settings):
+        collector=getattr(settings,"_security_collector",None)
+        if collector:
+            try:collector.rejected_identity(settings,msg.topic)
+            except Exception:print("[SECURITY] identity observation unavailable; telemetry validation preserved")
         print("[LOCAL MQTT] rejected message (identity, topic, size, or payload validation failed)")
         return False
     payload = json.loads(msg.payload.decode("utf-8"))
@@ -512,6 +517,8 @@ def main():
     serial_io_lock = Lock()
     state_dir = getattr(settings, "state_dir", "")
     state = DurableState(str(__import__('pathlib').Path(state_dir) / "delivery.sqlite3"), getattr(settings, "max_queued_messages", 50000)) if state_dir else None
+    security_collector=SecurityCollector.from_environment(state)
+    settings._security_collector=security_collector
     ada031_commands = Ada031SerialCommandManager(command_state=state)
 
     def apply_configuration(profile):
@@ -523,6 +530,9 @@ def main():
                 if asset.get("protocol") == "ada031_v4_serial"
                 and asset["assetId"] in set(settings.ada031_control_asset_ids)
             })
+        if security_collector:
+            try:security_collector.configuration_applied(digest)
+            except Exception:print("[SECURITY] configuration observation unavailable; applied configuration preserved")
         return digest
 
     local_enabled = getattr(settings, "local_mqtt_enabled", False)
@@ -548,6 +558,8 @@ def main():
 
     client = make_mqtt_client(settings, apply_configuration, relay_control, relay_ada031_control)
     publisher = DurablePublisher(client, state) if state else client
+    if security_collector:
+        Thread(target=security_collector.run,args=(STOP,client),daemon=True).start()
 
     def publish_telemetry(data: dict):
         payload = {
