@@ -17,9 +17,18 @@ class TelemetryPolicy:
         self._reported_at = clock()
         self._counts = dict(received=0, forwarded=0, suppressed=0, input_payload_bytes=0, forwarded_payload_bytes=0)
 
+    @staticmethod
+    def _comparison(record):
+        result={k:v for k,v in record.items() if k!="timestamp"}
+        for key in ("integration","observation"):
+            if isinstance(result.get(key),dict):result[key]={k:v for k,v in result[key].items() if k not in {"sequence","gatewayReceivedAt"}}
+        return result
+
     def _live(self, record):
         # Replayed history must not be mistaken for current proof of life or
         # discarded as redundant. Preserve its original timestamp and payload.
+        metadata=record.get("integration") or record.get("observation") or {}
+        if metadata.get("mode") in {"simulated","replay"} or metadata.get("sourceQuality") in {"bad","uncertain"} or metadata.get("retained") or record.get("transportRetained"):return False
         age = self.wall_clock() - record["timestamp"] / 1000
         return -5 <= age <= 15
 
@@ -38,7 +47,7 @@ class TelemetryPolicy:
             return True
         # Exact comparison deliberately preserves *every* measurement change:
         # alarm thresholds can be changed in the dashboard independently.
-        current = {k: v for k, v in record.items() if k != "timestamp"}
+        current = self._comparison(record)
         return current != values or self.clock() - sent_at >= self.snapshot_seconds
 
     def accepted(self, topic, record, payload_bytes, forwarded):
@@ -57,7 +66,7 @@ class TelemetryPolicy:
             previous = self._samples.get(key)
             if previous is not None and record["timestamp"] <= previous[0]:
                 return
-            self._samples[key] = (record["timestamp"], self.clock(), {k: v for k, v in record.items() if k != "timestamp"})
+            self._samples[key] = (record["timestamp"], self.clock(), self._comparison(record))
             self._samples.move_to_end(key)
             # Payloads may name assets; bound memory even if an authenticated
             # sensor sends a succession of previously unseen asset identities.

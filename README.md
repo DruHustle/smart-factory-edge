@@ -46,3 +46,11 @@ Do not enable remote firmware delivery until a signed release pipeline, hardware
 ### Classified equipment observations
 
 The existing Pi-local relay optionally preserves an `integration` provenance object, including explicit live/simulated/replay mode, UTC receipt time and run identity. Simulated/replay messages require their run IDs. Broker retained state is preserved and cannot be cleared by a payload assertion. The relay does not manufacture a live classification for legacy sources. Original observation time and provenance survive the existing durable queue. No Onesa account, server, SDK or additional poller is needed; native equipment visualization is owned by the Smart Factory dashboard.
+
+## Trusted telemetry candidate (27 October 2026)
+
+The candidate aligns site/line/device IDs with the [coordinated observation contract](https://github.com/DruHustle/smart-factory-iot-frontend/blob/feat/product-experience-trust/docs/trusted-observations.md). Dots and colons remain valid application identities. Source units and reviewed raw scaling evidence survive forwarding and durable retries; absent legacy provenance/units are not relabelled as verified live evidence. New WROVER acquisition metadata identifies source quality, boot session and sequence. Broker retention cannot be cleared by a payload.
+
+Gateway dependencies retain their existing versions and now include official artifact hashes. Regenerate with `python3 raspberry-pi/scripts/lock-gateway-dependencies.py`, review the lock changes, and install with `pip install --require-hashes -r raspberry-pi/requirements.txt`.
+
+Local software evidence: 76 Python tests passed and the changed WROVER `compile-check` environment compiled successfully. No firmware was flashed and no physical command, collector commissioning or hosted release was performed by these checks.

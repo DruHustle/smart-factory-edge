@@ -15,6 +15,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 
+from measurement_units import SOURCE_UNITS, mapped_value, valid_identity
+
 SUPPORTED_METRICS = {"temperature", "humidity", "vibration", "power", "pressure", "rpm"}
 SERIAL_SIGNAL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 MAX_SERIAL_RECORD_BYTES = 4096
@@ -25,7 +27,7 @@ def validate_asset_profile(profile: dict, expected_gateway_id: str) -> list[dict
     """Validate a complete, versioned desired-state profile before it reaches polling."""
     if not isinstance(profile, dict) or profile.get("schemaVersion") != 1:
         raise ValueError("Unsupported edge configuration schema version")
-    if profile.get("gatewayDeviceId") != expected_gateway_id:
+    if not valid_identity(expected_gateway_id) or profile.get("gatewayDeviceId") != expected_gateway_id:
         raise ValueError("Edge configuration targets a different gateway")
     assets = profile.get("assets")
     if not isinstance(assets, list) or len(assets) > 25:
@@ -59,6 +61,9 @@ def validate_asset_profile(profile: dict, expected_gateway_id: str) -> list[dict
                 if device_path in serial_device_paths:
                     raise ValueError("Only one asset profile may own a physical serial device")
                 serial_device_paths.add(device_path)
+        mapped_metrics = [str(m.get("metric")).lower() for m in mappings if m.get("metric")]
+        if len(mapped_metrics) != len(set(mapped_metrics)):
+            raise ValueError("Map each scalar metric once per asset")
         for mapping in mappings:
             if set(mapping) - {
                 "metric", "address", "nodeId", "registerType", "scale", "offset", "unit", "name",
@@ -68,6 +73,8 @@ def validate_asset_profile(profile: dict, expected_gateway_id: str) -> list[dict
             metric = mapping.get("metric")
             if metric is not None and str(metric).lower() not in SUPPORTED_METRICS:
                 raise ValueError("Tag mapping contains an unsupported metric")
+            if mapping.get("unit") and (metric not in SOURCE_UNITS or mapping["unit"] not in SOURCE_UNITS[metric]):
+                raise ValueError("Unsupported engineering unit for metric")
             count = mapping.get("count", 1)
             if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 2:
                 raise ValueError("Modbus count must be one or two registers for supported data types")
@@ -134,7 +141,7 @@ def _metric_name(mapping: dict) -> str | None:
     return metric if metric in SUPPORTED_METRICS else None
 
 
-def _decode_registers(registers: list[int], mapping: dict) -> float:
+def _decode_registers(registers: list[int], mapping: dict, raw_value=False) -> float:
     if not registers:
         raise ValueError("Modbus returned no registers")
     if len(registers) == 1:
@@ -155,7 +162,7 @@ def _decode_registers(registers: list[int], mapping: dict) -> float:
             value = raw - 0x100000000
         else:
             value = raw
-    return float(value) * float(mapping.get("scale", 1)) + float(mapping.get("offset", 0))
+    return float(value) if raw_value else float(value) * float(mapping.get("scale", 1)) + float(mapping.get("offset", 0))
 
 
 def read_modbus_tcp(endpoint: str, mappings: list[dict]) -> dict[str, float]:
@@ -212,7 +219,7 @@ def _read_modbus_mappings(client, mappings: list[dict]) -> dict[str, float]:
             response = client.read_holding_registers(address, count=count, device_id=device_id)
         if response.isError():
             raise IOError(f"Modbus read failed at register {address}")
-        values[metric] = _decode_registers(response.registers, mapping)
+        mapped_value(values, metric, _decode_registers(response.registers, mapping, raw_value=True), mapping, "register")
     return values
 
 
@@ -257,7 +264,7 @@ def read_opcua(endpoint: str, mappings: list[dict]) -> dict[str, float]:
             if metric is None or not node_id:
                 continue
             raw_value = client.get_node(str(node_id)).read_value()
-            values[metric] = float(raw_value) * float(mapping.get("scale", 1)) + float(mapping.get("offset", 0))
+            mapped_value(values, metric, raw_value, mapping)
     return values
 
 
@@ -335,7 +342,7 @@ def _serial_record_values(record: dict, mappings: list[dict]) -> dict[str, Any]:
             value = float(raw_value) * float(mapping.get("scale", 1)) + float(mapping.get("offset", 0))
             if not math.isfinite(value):
                 raise ValueError("Serial telemetry values must be finite numbers")
-            values[metric] = value
+            mapped_value(values, metric, raw_value, mapping)
 
     signals = record.get("signals")
     if signals is not None:

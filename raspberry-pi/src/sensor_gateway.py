@@ -3,6 +3,8 @@ import math
 import signal
 import sys
 import time
+import uuid
+from itertools import count
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
 
@@ -20,7 +22,8 @@ from ada031_control import Ada031SerialCommandManager, validate_command as valid
 from config import load_settings
 from durable_state import DurableState, DurablePublisher
 from telemetry_policy import TelemetryPolicy
-from provenance import normalize_provenance
+from provenance import normalize_provenance, IDENTIFIER
+from measurement_units import valid_identity, valid_units, valid_mapping
 from security_collector import SecurityCollector
 
 try:
@@ -33,8 +36,19 @@ STOP = Event()
 INGRESS_FAILED = Event()
 MAX_EPOCH_MILLISECONDS = 9_223_372_036_854_775_807
 WROVER_CONTROL_PINS = {18}
+GATEWAY_SESSION = str(uuid.uuid4())
+OBSERVATION_SEQUENCE = count()
 GPIO_COMMAND_FIELDS = {"schemaVersion", "action", "commandId", "targetDeviceId", "pin", "value", "holdMs", "expiresAt"}
 
+
+def gateway_observation(mode="live", quality="good"):
+    now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    result = {"mode": mode, "sessionId": GATEWAY_SESSION, "sequence": next(OBSERVATION_SEQUENCE), "sourceQuality": quality, "sourceConnection": "online", "timestampOrigin": "gateway", "retained": False, "gatewayReceivedAt": now}
+    if mode == "simulated": result["scenarioRunId"] = "gateway-synthetic:" + GATEWAY_SESSION
+    return normalize_provenance(result)
+
+def source_observation(value):
+    return isinstance(value,dict) and set(value)=={"schemaVersion","mode","sourceQuality","sessionId","sequence"} and type(value.get("schemaVersion")) is int and value["schemaVersion"]==1 and value.get("mode")=="live" and value.get("sourceQuality") in {"good","bad"} and isinstance(value.get("sessionId"),str) and IDENTIFIER.fullmatch(value["sessionId"]) is not None and isinstance(value.get("sequence"),int) and not isinstance(value["sequence"],bool) and 0<=value["sequence"]<=9007199254740991
 
 def _finite_number(value) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -46,14 +60,17 @@ def _finite_number(value) -> bool:
 
 
 def telemetry_topic(site_id: str, line_id: str, device_id: str) -> str:
+    if not all(valid_identity(value) for value in (site_id,line_id,device_id)): raise ValueError("Invalid MQTT topic identity")
     return f"factory/{site_id}/{line_id}/{device_id}/telemetry"
 
 
 def heartbeat_topic(site_id: str, line_id: str, device_id: str) -> str:
+    if not all(valid_identity(value) for value in (site_id,line_id,device_id)): raise ValueError("Invalid MQTT topic identity")
     return f"factory/{site_id}/{line_id}/{device_id}/heartbeat"
 
 
 def command_topic(site_id: str, line_id: str, device_id: str) -> str:
+    if not all(valid_identity(value) for value in (site_id,line_id,device_id)): raise ValueError("Invalid MQTT topic identity")
     return f"factory/{site_id}/{line_id}/{device_id}/commands"
 
 
@@ -68,7 +85,7 @@ def _valid_local_payload(topic: str, payload: bytes, settings) -> bool:
     _, site_id, line_id, device_id, kind = parts
     if (site_id, line_id) != (settings.site_id, settings.line_id):
         return False
-    if kind not in {"telemetry", "heartbeat"} or device_id not in settings.local_mqtt_device_ids:
+    if not all(valid_identity(value) for value in (site_id,line_id,device_id)) or kind not in {"telemetry", "heartbeat"} or device_id not in settings.local_mqtt_device_ids:
         return False
     try:
         record = json.loads(payload.decode("utf-8", errors="strict"))
@@ -83,9 +100,12 @@ def _valid_local_payload(topic: str, payload: bytes, settings) -> bool:
     if kind == "heartbeat":
         return set(record) == {"deviceId", "timestamp", "status"} and record.get("status") in {"online", "offline"}
 
-    allowed = {"deviceId", "timestamp", "temperature", "humidity", "vibration", "power", "pressure", "rpm", "sensorType", "sensorStatus", "assetId", "assetSignals", "integration"}
+    allowed = {"deviceId", "timestamp", "temperature", "humidity", "vibration", "power", "pressure", "rpm", "sensorType", "sensorStatus", "assetId", "assetSignals", "integration", "units", "observation", "mapping"}
     if any(key not in allowed for key in record):
         return False
+    if "units" in record and not valid_units(record["units"]): return False
+    if "observation" in record and not source_observation(record["observation"]): return False
+    if "mapping" in record and not valid_mapping(record["mapping"],record.get("units",{}),record): return False
     try:
         normalize_provenance(record.get("integration"))
     except ValueError:
@@ -143,9 +163,15 @@ def forward_local_message(settings, cloud_client, msg, policy=None) -> bool:
         print("[LOCAL MQTT] rejected message (identity, topic, size, or payload validation failed)")
         return False
     payload = json.loads(msg.payload.decode("utf-8"))
+    payload["transportRetained"] = bool(getattr(msg,"retain",False))
     gateway_id = getattr(settings, "device_id", "")
     if gateway_id:
         payload["gatewayId"] = gateway_id
+    observation=payload.pop("observation",None)
+    if observation is not None and "integration" not in payload:
+        metadata=gateway_observation("live",observation["sourceQuality"])
+        metadata.update({"timestampOrigin":"device","sessionId":observation["sessionId"],"sequence":observation["sequence"]})
+        payload["integration"]=metadata
     if isinstance(payload.get("integration"), dict):
         payload["integration"] = normalize_provenance(payload["integration"])
         # Preserve acquisition classification and observation time. Broker retained
@@ -483,6 +509,7 @@ def asset_poll_loop(
                     publish_fn({
                         "assetId": asset["assetId"],
                         **values,
+                        "integration": gateway_observation(),
                         "timestamp": int(datetime.now(tz=timezone.utc).timestamp() * 1000),
                     })
                 except Exception as exc:
@@ -573,6 +600,11 @@ def main():
             "pressure": data.get("pressure"),
             "rpm": data.get("rpm"),
         }
+        if data.get("units") is not None:
+            if not valid_units(data["units"]): raise ValueError("Invalid engineering units")
+            payload["units"]=data["units"]
+        if isinstance(data.get("mapping"),dict): payload["mapping"]=data["mapping"]
+        if isinstance(data.get("integration"),dict): payload["integration"]=normalize_provenance(data["integration"])
         if data.get("assetId"):
             payload["assetId"] = data["assetId"]
         if isinstance(data.get("assetSignals"), dict):
@@ -624,6 +656,8 @@ def main():
         if settings.synthetic_telemetry_enabled and not settings.serial_enabled and not asset_connections:
             synthetic = {
                 "temperature": 24.5,
+                "units": {"temperature":"Cel","humidity":"%","vibration":"mm/s","power":"W","pressure":"bar","rpm":"1/min"},
+                "integration": gateway_observation("simulated"),
                 "humidity": 55.0,
                 "vibration": 0.15,
                 "power": 120.0,
