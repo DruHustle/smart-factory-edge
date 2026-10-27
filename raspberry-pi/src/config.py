@@ -107,7 +107,7 @@ def load_settings() -> Settings:
         publish_interval_seconds=int(os.getenv("PUBLISH_INTERVAL_SECONDS", "5")),
     )
     import re
-    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value) for value in
+    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", value) for value in
            (settings.device_id, settings.site_id, settings.line_id, *settings.local_mqtt_device_ids)):
         raise RuntimeError("MQTT identities must be safe topic segments")
     if settings.publish_interval_seconds < 1 or settings.asset_poll_interval_seconds <= 0 or settings.max_queued_messages < 1:

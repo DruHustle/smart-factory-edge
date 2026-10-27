@@ -75,6 +75,14 @@ class DurablePublisher:
         if item is None or not self.client.is_connected():
             return False
         identity, topic, payload = item
+        if topic.startswith("factory/"):
+            from mqtt_topics import decode_level,topic as encoded_topic
+            parts=topic.split("/")
+            if len(parts)==5:
+                try:topic=encoded_topic(*(decode_level(p) for p in parts[1:4]),parts[4])
+                except ValueError:
+                    print("[DELIVERY] Queued topic requires identity/route review; evidence retained")
+                    return False
         message = self.client.publish(topic, payload, qos=1, retain=False)
         if message.rc != 0:
             return False

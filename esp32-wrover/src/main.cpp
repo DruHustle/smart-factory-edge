@@ -45,6 +45,17 @@
 #endif
 
 bool mdnsStarted = false;
+bool identityConfigurationValid = false;
+bool compatibleIdentity(const char* value) {
+  if (!value) return false;
+  const size_t length = strlen(value);
+  if (length < 1 || length > 64) return false;
+  for (size_t i=0;i<length;i++) {
+    const char c=value[i]; const bool alphanumeric=(c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9');
+    if (!alphanumeric && (i==0 || (c!='_'&&c!='.'&&c!=':'&&c!='-'))) return false;
+  }
+  return true;
+}
 
 bool resolveMdnsHostname(const char* hostname, IPAddress& address) {
   if (hostname == nullptr) return false;
@@ -126,21 +137,18 @@ uint8_t nextRecentCommandId = 0;
 
 bool publishQos1(const String& topic, const char* payload, size_t payloadSize);
 
-String topicTelemetry() {
-  return String("factory/") + SITE_ID + "/" + LINE_ID + "/" + DEVICE_ID + "/telemetry";
+// mqtt-topic-v1: dots are encoded for RabbitMQ; JSON identity remains canonical.
+String topicLevel(const char* value) {
+  String result(value); result.replace(".","%2E"); return result;
 }
-
-String topicHeartbeat() {
-  return String("factory/") + SITE_ID + "/" + LINE_ID + "/" + DEVICE_ID + "/heartbeat";
+String topicFor(const char* kind) {
+  String result=String("factory/")+topicLevel(SITE_ID)+"/"+topicLevel(LINE_ID)+"/"+topicLevel(DEVICE_ID)+"/"+kind;
+  return result.length()<=255 ? result : String("");
 }
-
-String topicCommands() {
-  return String("factory/") + SITE_ID + "/" + LINE_ID + "/" + DEVICE_ID + "/commands";
-}
-
-String topicControlAck() {
-  return String("factory/") + SITE_ID + "/" + LINE_ID + "/" + DEVICE_ID + "/control-ack";
-}
+String topicTelemetry(){return topicFor("telemetry");}
+String topicHeartbeat(){return topicFor("heartbeat");}
+String topicCommands(){return topicFor("commands");}
+String topicControlAck(){return topicFor("control-ack");}
 
 uint64_t currentEpochMilliseconds() {
   timeval now;
@@ -323,9 +331,14 @@ void connectWifi() {
   }
   Serial.printf("\n[WIFI] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
   if (!mdnsStarted) {
-    mdnsStarted = MDNS.begin(DEVICE_ID);
+    // mDNS hostnames have a different grammar; the MQTT/application identity is preserved.
+    String networkHost=DEVICE_ID;
+    bool dnsCompatible=networkHost.length()<=63;
+    for(size_t i=0;i<networkHost.length();i++) {const char c=networkHost[i];if(!((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='-'))dnsCompatible=false;}
+    if(!dnsCompatible)networkHost=String("sf-")+String(static_cast<uint32_t>(ESP.getEfuseMac()),HEX);
+    mdnsStarted = MDNS.begin(networkHost.c_str());
     if (mdnsStarted) {
-      Serial.printf("[mDNS] responder started as %s.local\n", DEVICE_ID);
+      Serial.printf("[mDNS] network alias %s.local; application identity unchanged\n", networkHost.c_str());
     } else {
       Serial.println("[mDNS] responder could not start; .local gateway lookup may fail");
     }
@@ -370,6 +383,9 @@ bool publishQos1(const String& topic, const char* payload, size_t payloadSize) {
   return true;
 }
 
+String telemetrySession;
+uint64_t telemetrySequence = 0;
+
 void publishTelemetry() {
   if (!clockReady) {
     Serial.println("[TIME] Waiting for UTC clock sync; skipping telemetry");
@@ -386,6 +402,16 @@ void publishTelemetry() {
   doc["deviceId"] = DEVICE_ID;
   doc["sensorType"] = "DHT11";
   doc["sensorStatus"] = readingValid ? "ok" : "read_error";
+  JsonObject units = doc["units"].to<JsonObject>();
+  units["temperature"] = "Cel";
+  units["humidity"] = "%";
+  JsonObject observation = doc["observation"].to<JsonObject>();
+  observation["schemaVersion"] = 1;
+  observation["mode"] = "live";
+  observation["sourceQuality"] = readingValid ? "good" : "bad";
+  observation["sessionId"] = telemetrySession;
+  observation["sequence"] = telemetrySequence++;
+
   timeval now;
   gettimeofday(&now, nullptr);
   const uint64_t timestampMs = static_cast<uint64_t>(now.tv_sec) * 1000ULL + static_cast<uint64_t>(now.tv_usec / 1000);
@@ -400,7 +426,7 @@ void publishTelemetry() {
     Serial.printf("[DHT11] Read failed on GPIO%u; omitting temperature/humidity values\n", DHT11_DATA_PIN);
   }
 
-  char out[384];
+  char out[512]; // Bounded space for explicit units/acquisition provenance; wire cap remains 16 KiB.
   const size_t size = serializeJson(doc, out, sizeof(out));
   if (size == 0 || size >= sizeof(out)) {
     Serial.println("[MQTT] Telemetry serialization failed or exceeded buffer size");
@@ -423,11 +449,17 @@ void publishTelemetry() {
 }
 
 void setup() {
+  char session[18];
+  snprintf(session, sizeof(session), "%08lx-%08lx", static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()));
+  telemetrySession = session;
+
   Serial.begin(115200);
   delay(300);
   dht11Sensor.begin();
   Serial.printf("[DHT11] Sensor initialized on GPIO%u; readings publish every %lu ms\n", DHT11_DATA_PIN, publishIntervalMs);
   configureControlOutputs();
+  identityConfigurationValid=compatibleIdentity(SITE_ID)&&compatibleIdentity(LINE_ID)&&compatibleIdentity(DEVICE_ID)&&topicControlAck().length()>0;
+  if(!identityConfigurationValid){Serial.println("[CONFIG] Invalid site, line or device identity; outputs remain safe and networking is disabled");return;}
   buttonPreferencesReady = buttonPreferences.begin("sf-button", false);
   if (buttonPreferencesReady) {
     buttonPressCount = buttonPreferences.getULong("pressCount", 0);
@@ -461,6 +493,7 @@ void setup() {
 }
 
 void loop() {
+  if(!identityConfigurationValid){delay(200);return;}
   if (WiFi.status() != WL_CONNECTED) {
     // Drop any energized output before a potentially long network recovery.
     setAllControlOutputsSafe();

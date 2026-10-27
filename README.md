@@ -46,3 +46,19 @@ Do not enable remote firmware delivery until a signed release pipeline, hardware
 ### Classified equipment observations
 
 The existing Pi-local relay optionally preserves an `integration` provenance object, including explicit live/simulated/replay mode, UTC receipt time and run identity. Simulated/replay messages require their run IDs. Broker retained state is preserved and cannot be cleared by a payload assertion. The relay does not manufacture a live classification for legacy sources. Original observation time and provenance survive the existing durable queue. No Onesa account, server, SDK or additional poller is needed; native equipment visualization is owned by the Smart Factory dashboard.
+
+## Trusted telemetry candidate (27 October 2026)
+
+The candidate aligns site/line/device IDs with the [coordinated observation contract](https://github.com/DruHustle/smart-factory-iot-frontend/blob/feat/product-experience-trust/docs/trusted-observations.md). Dots and colons remain valid application identities. Source units and reviewed raw scaling evidence survive forwarding and durable retries; absent legacy provenance/units are not relabelled as verified live evidence. New WROVER acquisition metadata identifies source quality, boot session and sequence. Broker retention cannot be cleared by a payload.
+
+Gateway dependencies retain their existing versions and now include official artifact hashes. Regenerate with `python3 raspberry-pi/scripts/lock-gateway-dependencies.py`, review the lock changes, and install with `pip install --require-hashes -r raspberry-pi/requirements.txt`.
+
+Local software evidence: 76 Python tests passed and the changed WROVER `compile-check` environment compiled successfully. No firmware was flashed and no physical command, collector commissioning or hosted release was performed by these checks.
+
+## MQTT topic identity and acquisition context
+
+Canonical payload and registered IDs are unchanged. Topic levels use `mqtt-topic-v1`: a literal dot is `%2E`, so `sensor.temp:01` publishes under `sensor%2Etemp:01`. Colons are preserved. Only the dot escape is decoded; wildcard, slash, nested and other escapes are rejected. Encoded routes are bounded to 255 bytes. The gateway normalizes older raw-dot Mosquitto topics and persisted spool routes on forwarding without rewriting acquisition JSON. Review exact publisher and device-specific ACL routes during commissioning; this release does not change a factory broker or ACL. See the [telemetry contract](https://github.com/DruHustle/smart-factory-iot-frontend/blob/main/docs/telemetry-contract.md).
+
+Pi-local ingress requires MQTT 5 with persistent sessions and Retain As Published subscriptions. Only actual subscription acknowledgements establish verified transport context; disconnects clear it. Local publisher JSON cannot assert that flag. Retained, old or unverified deliveries remain historical downstream, including when an MQTT 5 cloud subscriber receives them. The durable queue retains original acquisition identity across retries.
+
+The disposable two-broker qualification passed with a Mosquitto local broker and either RabbitMQ 4.3.6 or Mosquitto 2.0.22 cloud broker. It exercised actual Pi subscription, spool, .NET/Node ingestion, punctuated IDs, mixed evidence and units, outage/restart, duplicates and database restore. The edge suite passed 78 tests and ESP32 compilation; no firmware was flashed and no physical control was issued. Hosted TLS/ACLs, Pi installation and hardware feedback remain separate commissioning acceptance.
