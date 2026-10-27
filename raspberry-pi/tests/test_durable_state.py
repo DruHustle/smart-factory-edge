@@ -8,6 +8,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from durable_state import DurableState, DurablePublisher
 
 class DurableStateTests(unittest.TestCase):
+    def test_old_dotted_topics_reopen_and_publish_without_renaming_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=str(Path(directory)/"state.sqlite3")
+            payload='{"deviceId":"sensor.temp:01","temperature":42}'
+            state=DurableState(path);state.enqueue("factory/site/line.01/sensor.temp:01/telemetry",payload);state.close()
+            state=DurableState(path);published=[]
+            def send(topic,body,**_):
+                published.append((topic,body));return SimpleNamespace(rc=0,wait_for_publish=lambda **_:None,is_published=lambda:True)
+            client=SimpleNamespace(is_connected=lambda:True,publish=send)
+            self.assertTrue(DurablePublisher(client,state).drain_one())
+            self.assertEqual(published,[("factory/site/line%2E01/sensor%2Etemp:01/telemetry",payload)])
+            self.assertIsNone(state.first());state.close()
+
     def test_queue_and_command_reservation_survive_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "delivery.sqlite3")

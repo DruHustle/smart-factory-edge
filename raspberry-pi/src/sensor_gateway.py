@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from threading import Event, Lock, Thread
 
 import paho.mqtt.client as mqtt
+from paho.mqtt.properties import Properties
+from paho.mqtt.packettypes import PacketTypes
 from dotenv import load_dotenv
 
 from asset_adapters import (
@@ -24,6 +26,7 @@ from durable_state import DurableState, DurablePublisher
 from telemetry_policy import TelemetryPolicy
 from provenance import normalize_provenance, IDENTIFIER
 from measurement_units import valid_identity, valid_units, valid_mapping
+from mqtt_topics import encode_level, decode_level, topic as encoded_topic
 from security_collector import SecurityCollector
 
 try:
@@ -60,19 +63,15 @@ def _finite_number(value) -> bool:
 
 
 def telemetry_topic(site_id: str, line_id: str, device_id: str) -> str:
-    if not all(valid_identity(value) for value in (site_id,line_id,device_id)): raise ValueError("Invalid MQTT topic identity")
-    return f"factory/{site_id}/{line_id}/{device_id}/telemetry"
+    return encoded_topic(site_id,line_id,device_id,"telemetry")
 
 
 def heartbeat_topic(site_id: str, line_id: str, device_id: str) -> str:
-    if not all(valid_identity(value) for value in (site_id,line_id,device_id)): raise ValueError("Invalid MQTT topic identity")
-    return f"factory/{site_id}/{line_id}/{device_id}/heartbeat"
+    return encoded_topic(site_id,line_id,device_id,"heartbeat")
 
 
 def command_topic(site_id: str, line_id: str, device_id: str) -> str:
-    if not all(valid_identity(value) for value in (site_id,line_id,device_id)): raise ValueError("Invalid MQTT topic identity")
-    return f"factory/{site_id}/{line_id}/{device_id}/commands"
-
+    return encoded_topic(site_id,line_id,device_id,"commands")
 
 
 def _valid_local_payload(topic: str, payload: bytes, settings) -> bool:
@@ -82,7 +81,11 @@ def _valid_local_payload(topic: str, payload: bytes, settings) -> bool:
     parts = topic.split("/")
     if len(parts) != 5 or parts[0] != "factory":
         return False
-    _, site_id, line_id, device_id, kind = parts
+    try:
+        site_id,line_id,device_id=(decode_level(p) for p in parts[1:4])
+    except ValueError:
+        return False
+    kind=parts[4]
     if (site_id, line_id) != (settings.site_id, settings.line_id):
         return False
     if not all(valid_identity(value) for value in (site_id,line_id,device_id)) or kind not in {"telemetry", "heartbeat"} or device_id not in settings.local_mqtt_device_ids:
@@ -153,7 +156,7 @@ class LocalDeliveryError(RuntimeError):
     """A valid local message has not yet reached durable gateway storage."""
 
 
-def forward_local_message(settings, cloud_client, msg, policy=None) -> bool:
+def forward_local_message(settings, cloud_client, msg, policy=None, transport_verified=False) -> bool:
     """Forward a validated WROVER message without exposing the cloud broker to it."""
     if not _valid_local_payload(msg.topic, msg.payload, settings):
         collector=getattr(settings,"_security_collector",None)
@@ -164,6 +167,7 @@ def forward_local_message(settings, cloud_client, msg, policy=None) -> bool:
         return False
     payload = json.loads(msg.payload.decode("utf-8"))
     payload["transportRetained"] = bool(getattr(msg,"retain",False))
+    payload["transportRetainVerified"] = bool(transport_verified)
     gateway_id = getattr(settings, "device_id", "")
     if gateway_id:
         payload["gatewayId"] = gateway_id
@@ -183,7 +187,7 @@ def forward_local_message(settings, cloud_client, msg, policy=None) -> bool:
         policy.accepted(msg.topic, payload, payload_bytes, forwarded=False)
         policy.report_if_due()
         return True
-    result = cloud_client.publish(msg.topic, forwarded_payload, qos=1, retain=False)
+    result = cloud_client.publish(encoded_topic(settings.site_id,settings.line_id,payload["deviceId"],msg.topic.split("/")[-1]), forwarded_payload, qos=1, retain=False)
     if getattr(result, "rc", 0) != getattr(mqtt, "MQTT_ERR_SUCCESS", 0):
         print(f"[LOCAL MQTT] upstream queue rejected message on {msg.topic}")
         raise LocalDeliveryError("Durable queue rejected local telemetry")
@@ -247,9 +251,10 @@ def relay_gpio_command(settings, local_client, command: dict) -> dict:
 def forward_local_control_ack(settings, cloud_client, msg) -> bool:
     """Forward a WROVER acknowledgement to the gateway's scoped cloud ack topic."""
     parts = msg.topic.split("/")
-    if len(parts) != 5 or parts[0] != "factory" or parts[1:3] != [settings.site_id, settings.line_id] or parts[4] != "control-ack":
-        return False
-    device_id = parts[3]
+    if len(parts)!=5 or parts[0]!="factory" or parts[4]!="control-ack":return False
+    try: site,line,device_id=(decode_level(p) for p in parts[1:4])
+    except ValueError:return False
+    if [site,line]!=[settings.site_id,settings.line_id]:return False
     if device_id not in set(getattr(settings, "local_mqtt_control_device_ids", ())):
         return False
     if len(msg.payload) > 1024:
@@ -272,7 +277,7 @@ def forward_local_control_ack(settings, cloud_client, msg) -> bool:
     if pin is not None and (isinstance(pin, bool) or not isinstance(pin, int) or pin not in WROVER_CONTROL_PINS):
         return False
     result = cloud_client.publish(
-        command_topic(settings.site_id, settings.line_id, settings.device_id) + "/ack",
+        encoded_topic(settings.site_id,settings.line_id,settings.device_id,"commands/ack"),
         json.dumps({**ack, "gatewayDeviceId": settings.device_id}),
         qos=1,
         retain=False,
@@ -285,7 +290,9 @@ def forward_local_control_ack(settings, cloud_client, msg) -> bool:
 def make_local_mqtt_client(settings, cloud_client):
     """Create the local-only WROVER ingress client; this client never has cloud credentials."""
     client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-                         client_id=settings.local_mqtt_client_id, clean_session=False, manual_ack=True)
+                         client_id=settings.local_mqtt_client_id, protocol=mqtt.MQTTv5, manual_ack=True)
+    client._transport_verified=False
+    subscriptions=set()
     policy = TelemetryPolicy(getattr(settings, "telemetry_coalescing_enabled", True),
                              getattr(settings, "telemetry_snapshot_seconds", 60))
     if settings.local_mqtt_username:
@@ -294,14 +301,32 @@ def make_local_mqtt_client(settings, cloud_client):
         client.tls_set(ca_certs=settings.local_mqtt_ca_cert or None)
 
     def on_connect(_client, _userdata, _flags, rc, _properties=None):
+        _client._transport_verified=False
+        subscriptions.clear()
         if rc == 0:
-            _client.subscribe(f"factory/{settings.site_id}/{settings.line_id}/+/telemetry", qos=1)
-            _client.subscribe(f"factory/{settings.site_id}/{settings.line_id}/+/heartbeat", qos=1)
-            for device_id in getattr(settings, "local_mqtt_control_device_ids", ()):
-                _client.subscribe(f"factory/{settings.site_id}/{settings.line_id}/{device_id}/control-ack", qos=1)
-            print("[LOCAL MQTT] connected to Pi broker and subscribed to allowlisted sensor topics")
+            patterns=[]
+            for site,line in sorted({(encode_level(settings.site_id),encode_level(settings.line_id)),(settings.site_id,settings.line_id)}):
+                patterns.extend((f"factory/{site}/{line}/+/telemetry",f"factory/{site}/{line}/+/heartbeat"))
+            patterns.extend(encoded_topic(settings.site_id,settings.line_id,d,"control-ack") for d in getattr(settings,"local_mqtt_control_device_ids",()))
+            for pattern in patterns:
+                result,mid=_client.subscribe(pattern,options=mqtt.SubscribeOptions(qos=1,retainAsPublished=True))
+                if result != mqtt.MQTT_ERR_SUCCESS:
+                    INGRESS_FAILED.set();STOP.set();return
+                subscriptions.add(mid)
+            print("[LOCAL MQTT] connected; verifying retained-delivery subscriptions")
         else:
             print(f"[LOCAL MQTT] broker connection failed rc={rc}")
+
+    def on_subscribe(_client,_userdata,mid,reason_codes,_properties=None):
+        if any(getattr(code,"is_failure",False) for code in reason_codes):
+            _client._transport_verified=False
+            INGRESS_FAILED.set();STOP.set();return
+        subscriptions.discard(mid)
+        _client._transport_verified=not subscriptions
+
+    def on_disconnect(_client,*_args):
+        _client._transport_verified=False
+        subscriptions.clear()
 
     def on_message(_client, _userdata, msg):
         try:
@@ -309,7 +334,7 @@ def make_local_mqtt_client(settings, cloud_client):
                 if not forward_local_control_ack(settings, cloud_client, msg):
                     print("[LOCAL MQTT] rejected invalid WROVER control acknowledgement")
             else:
-                forward_local_message(settings, cloud_client, msg, policy)
+                forward_local_message(settings, cloud_client, msg, policy,transport_verified=_client._transport_verified)
             # Invalid payloads are permanent rejects. Valid messages are ACKed
             # only after durable queuing or intentional policy suppression.
             _client.ack(msg.mid, msg.qos)
@@ -319,8 +344,16 @@ def make_local_mqtt_client(settings, cloud_client):
             STOP.set()
 
     client.on_connect = on_connect
+    client.on_subscribe=on_subscribe
+    client.on_disconnect=on_disconnect
     client.on_message = on_message
     return client
+
+
+def connect_local_mqtt(client,settings):
+    properties=Properties(PacketTypes.CONNECT)
+    properties.SessionExpiryInterval=0xFFFFFFFF
+    client.connect(settings.local_mqtt_host,settings.local_mqtt_port,keepalive=60,clean_start=False,properties=properties)
 
 
 def make_mqtt_client(settings, apply_configuration=None, relay_control=None, relay_ada031_control=None):
@@ -631,7 +664,7 @@ def main():
 
     if local_enabled:
         local_client = make_local_mqtt_client(settings, publisher)
-        local_client.connect(settings.local_mqtt_host, settings.local_mqtt_port, keepalive=60)
+        connect_local_mqtt(local_client,settings)
         local_client.loop_start()
 
     serial_thread = Thread(

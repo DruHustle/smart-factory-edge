@@ -38,7 +38,9 @@ def main():
         deadline = time.monotonic() + 8
         while True:
             try:
-                client.connect("127.0.0.1", port)
+                if getattr(client,"_protocol",None)==mqtt.MQTTv5:
+                    gateway.connect_local_mqtt(client,SimpleNamespace(local_mqtt_host="127.0.0.1",local_mqtt_port=port))
+                else:client.connect("127.0.0.1", port)
                 break
             except OSError:
                 if time.monotonic() >= deadline:
@@ -79,7 +81,11 @@ def main():
             def ingress():
                 ready = []
                 local = gateway.make_local_mqtt_client(settings, publisher)
-                local.on_subscribe = lambda *_: ready.append(True)
+                original_subscribe=local.on_subscribe
+                def subscribed(*args):
+                    original_subscribe(*args)
+                    if local._transport_verified:ready.append(True)
+                local.on_subscribe=subscribed
                 original_ack = local.ack
                 local.ack = lambda mid, qos: (acked.append(mid), original_ack(mid, qos))[1]
                 original_message = local.on_message

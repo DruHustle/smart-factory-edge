@@ -2,17 +2,24 @@ import json,sys,types,unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
 from measurement_units import valid_identity,valid_units,mapped_value,valid_mapping
+from mqtt_topics import encode_level,decode_level,topic
 from sensor_gateway import telemetry_topic,heartbeat_topic,command_topic,forward_local_message
 
 class TrustedMeasurementTests(unittest.TestCase):
  def test_all_topic_builders_share_the_wire_identity_contract(self):
   for identity in ('a','sensor.temp:01','legacy_01','sensor-01'):
    self.assertTrue(valid_identity(identity))
-   for build in (telemetry_topic,heartbeat_topic,command_topic):self.assertIn('/'+identity+'/',build('site','line',identity))
+   for build in (telemetry_topic,heartbeat_topic,command_topic):
+    encoded=build('site','line',identity);self.assertIn('/'+encode_level(identity)+'/',encoded);self.assertEqual(decode_level(encoded.split('/')[3]),identity)
   for identity in ('bad/topic','bad#id','+','a'*65,':starts'):
    self.assertFalse(valid_identity(identity))
    for build in (telemetry_topic,heartbeat_topic,command_topic):
     with self.assertRaises(ValueError):build('site','line',identity)
+ def test_topic_encoding_cannot_change_identity_or_escape_a_level(self):
+  for bad in ('sensor%2Fbad','sensor%252Ebad','sensor%23bad','sensor%00bad'):
+   with self.assertRaises(ValueError):decode_level(bad)
+  with self.assertRaises(ValueError):topic('a'+'.'*63,'b'+'.'*63,'c'+'.'*63,'telemetry')
+  self.assertEqual(decode_level('sensor.temp:01'),'sensor.temp:01')
  def test_preserves_raw_scaling_and_declared_engineering_unit(self):
   output={};mapped_value(output,'power',15,{'unit':'kW','scale':.1,'offset':0},'register')
   self.assertEqual(output['power'],1.5);self.assertEqual(output['units'],{'power':'kW'})

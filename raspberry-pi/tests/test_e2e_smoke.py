@@ -64,7 +64,7 @@ class FakeMqttClient:
     def tls_set(self, *_args, **_kwargs):
         self.tls_options = (_args, _kwargs)
 
-    def connect(self, host, port, keepalive=60):
+    def connect(self, host, port, keepalive=60, **_kwargs):
         self.connected = (host, port, keepalive)
 
     def loop_start(self):
@@ -80,14 +80,23 @@ class FakeMqttClient:
         self.published.append((topic, payload, qos, retain))
         return types.SimpleNamespace(rc=0)
 
-    def subscribe(self, topic, qos=0):
+    def subscribe(self, topic, qos=0, options=None):
         self.subscribed.append(topic)
+        return (0,len(self.subscribed))
 
 
 def _install_paho_stub() -> None:
     client_mod = types.ModuleType("paho.mqtt.client")
     client_mod.Client = lambda *args, **kwargs: FakeMqttClient()
     client_mod.MQTT_ERR_SUCCESS = 0
+    client_mod.MQTTv5=5
+    client_mod.SubscribeOptions=lambda **kwargs:types.SimpleNamespace(**kwargs)
+    properties_mod=types.ModuleType("paho.mqtt.properties")
+    properties_mod.Properties=lambda _:types.SimpleNamespace()
+    packet_mod=types.ModuleType("paho.mqtt.packettypes")
+    packet_mod.PacketTypes=types.SimpleNamespace(CONNECT=1)
+    sys.modules["paho.mqtt.properties"]=properties_mod
+    sys.modules["paho.mqtt.packettypes"]=packet_mod
     client_mod.CallbackAPIVersion = types.SimpleNamespace(VERSION2=2)
 
     mqtt_mod = types.ModuleType("paho.mqtt")
@@ -402,6 +411,13 @@ class GatewaySmokeTests(unittest.TestCase):
         local = sensor_gateway.make_local_mqtt_client(settings, cloud)
         local.on_connect(local, None, None, 0)
         self.assertEqual(local.subscribed, ["factory/factory-a/line-1/+/telemetry", "factory/factory-a/line-1/+/heartbeat"])
+        self.assertFalse(local._transport_verified)
+        local.on_subscribe(local,None,1,[])
+        self.assertFalse(local._transport_verified)
+        local.on_subscribe(local,None,2,[])
+        self.assertTrue(local._transport_verified)
+        local.on_disconnect(local)
+        self.assertFalse(local._transport_verified)
 
     def test_local_ack_waits_for_durable_acceptance_and_failure_requests_restart(self):
         gateway = importlib.import_module("sensor_gateway")

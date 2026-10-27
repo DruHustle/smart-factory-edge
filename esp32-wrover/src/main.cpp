@@ -137,21 +137,18 @@ uint8_t nextRecentCommandId = 0;
 
 bool publishQos1(const String& topic, const char* payload, size_t payloadSize);
 
-String topicTelemetry() {
-  return String("factory/") + SITE_ID + "/" + LINE_ID + "/" + DEVICE_ID + "/telemetry";
+// mqtt-topic-v1: dots are encoded for RabbitMQ; JSON identity remains canonical.
+String topicLevel(const char* value) {
+  String result(value); result.replace(".","%2E"); return result;
 }
-
-String topicHeartbeat() {
-  return String("factory/") + SITE_ID + "/" + LINE_ID + "/" + DEVICE_ID + "/heartbeat";
+String topicFor(const char* kind) {
+  String result=String("factory/")+topicLevel(SITE_ID)+"/"+topicLevel(LINE_ID)+"/"+topicLevel(DEVICE_ID)+"/"+kind;
+  return result.length()<=255 ? result : String("");
 }
-
-String topicCommands() {
-  return String("factory/") + SITE_ID + "/" + LINE_ID + "/" + DEVICE_ID + "/commands";
-}
-
-String topicControlAck() {
-  return String("factory/") + SITE_ID + "/" + LINE_ID + "/" + DEVICE_ID + "/control-ack";
-}
+String topicTelemetry(){return topicFor("telemetry");}
+String topicHeartbeat(){return topicFor("heartbeat");}
+String topicCommands(){return topicFor("commands");}
+String topicControlAck(){return topicFor("control-ack");}
 
 uint64_t currentEpochMilliseconds() {
   timeval now;
@@ -461,7 +458,7 @@ void setup() {
   dht11Sensor.begin();
   Serial.printf("[DHT11] Sensor initialized on GPIO%u; readings publish every %lu ms\n", DHT11_DATA_PIN, publishIntervalMs);
   configureControlOutputs();
-  identityConfigurationValid=compatibleIdentity(SITE_ID)&&compatibleIdentity(LINE_ID)&&compatibleIdentity(DEVICE_ID);
+  identityConfigurationValid=compatibleIdentity(SITE_ID)&&compatibleIdentity(LINE_ID)&&compatibleIdentity(DEVICE_ID)&&topicControlAck().length()>0;
   if(!identityConfigurationValid){Serial.println("[CONFIG] Invalid site, line or device identity; outputs remain safe and networking is disabled");return;}
   buttonPreferencesReady = buttonPreferences.begin("sf-button", false);
   if (buttonPreferencesReady) {
