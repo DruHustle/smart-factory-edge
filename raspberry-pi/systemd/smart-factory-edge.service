@@ -9,10 +9,10 @@ Type=simple
 User=smartfactory
 Group=smartfactory
 SupplementaryGroups=dialout
-WorkingDirectory=/opt/smart-factory-iot-edge/raspberry-pi
+WorkingDirectory=/opt/smart-factory-edge/raspberry-pi
 EnvironmentFile=/etc/smart-factory-iot/edge.env
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/smart-factory-iot-edge/raspberry-pi/.venv/bin/python /opt/smart-factory-iot-edge/raspberry-pi/src/sensor_gateway.py
+ExecStart=/opt/smart-factory-edge/raspberry-pi/.venv/bin/python /opt/smart-factory-edge/raspberry-pi/src/sensor_gateway.py
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
