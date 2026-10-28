@@ -27,7 +27,7 @@ def main():
         path = bundle / name
         if not path.resolve().is_relative_to(bundle) or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise SystemExit("Bundle checksum mismatch: " + name)
-    app = Path("/opt/smart-factory-iot-edge/raspberry-pi")
+    app = Path("/opt/smart-factory-edge/raspberry-pi")
     dropin = Path("/etc/systemd/system/smart-factory-edge.service.d/40-telemetry.conf")
     policy_env = Path("/etc/smart-factory-iot/telemetry.env")
     if dropin.exists() or policy_env.exists():

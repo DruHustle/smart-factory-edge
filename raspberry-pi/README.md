@@ -6,7 +6,7 @@ Gateway dependencies and their resolved transitive versions are pinned in `requi
 
 ## Relationship to the cloud deployment
 
-The React UI runs on Vercel. One reviewed, non-root backend image runs as separate API and singleton worker containers on the Oracle VM alongside BaSyx. The API role runs the Node API plus Device, Identity and Analytics services; the worker role runs Telemetry and Notification services. Managed databases, Redis and CloudAMQP remain external. The Raspberry Pi stays in the factory and runs the systemd service below. ESP32 WROVER firmware is built and uploaded over USB with PlatformIO; the ADA031 V4 controller uses its USB/Arduino workflow. The Pi publishes upstream to CloudAMQP MQTT over TLS using its own gateway identity. See the [Oracle deployment guide](https://github.com/DruHustle/smart-factory-iot-frontend/blob/main/deploy/oracle/README.md) for production and the [deployment index](../README.md) for edge setup. The [Vercel/Render guide](https://github.com/DruHustle/smart-factory-iot-frontend/blob/main/RENDER_DEPLOYMENT.md) remains available for local development and historical rollback.
+The React UI runs on Vercel. One reviewed, non-root backend image runs as separate API and singleton worker containers on the Oracle VM alongside BaSyx. The API role runs the Node API plus Device, Identity and Analytics services; the worker role runs Telemetry and Notification services. Managed databases, Redis and CloudAMQP remain external. The Raspberry Pi stays in the factory and runs the systemd service below. ESP32 WROVER firmware is built and uploaded over USB with PlatformIO; the ADA031 V4 controller uses its USB/Arduino workflow. The Pi publishes upstream to CloudAMQP MQTT over TLS using its own gateway identity. See the [Oracle deployment guide](https://github.com/DruHustle/smart-factory-frontend/blob/main/deploy/oracle/README.md) for production and the [deployment index](../README.md) for edge setup. The [Vercel/Render guide](https://github.com/DruHustle/smart-factory-frontend/blob/main/RENDER_DEPLOYMENT.md) remains available for local development and historical rollback.
 
 ## Manual install
 
@@ -70,10 +70,10 @@ Copy `.env.example` to `/etc/smart-factory-iot/edge.env` and keep `EDGE_ENV=prod
 Use a dedicated unprivileged `smartfactory` service account. Keep secrets under `/etc/smart-factory-iot/`, owned by root and readable only by the service group. The unit uses the app's virtual environment, `dialout` for serial hardware, and systemd hardening.
 
 ```bash
-sudo useradd --system --home-dir /opt/smart-factory-iot-edge --shell /usr/sbin/nologin --groups dialout smartfactory
-sudo install -d -o smartfactory -g smartfactory -m 0750 /opt/smart-factory-iot-edge/raspberry-pi
-sudo -u smartfactory python3 -m venv /opt/smart-factory-iot-edge/raspberry-pi/.venv
-sudo -u smartfactory /opt/smart-factory-iot-edge/raspberry-pi/.venv/bin/pip install -r /opt/smart-factory-iot-edge/raspberry-pi/requirements.txt
+sudo useradd --system --home-dir /opt/smart-factory-edge --shell /usr/sbin/nologin --groups dialout smartfactory
+sudo install -d -o smartfactory -g smartfactory -m 0750 /opt/smart-factory-edge/raspberry-pi
+sudo -u smartfactory python3 -m venv /opt/smart-factory-edge/raspberry-pi/.venv
+sudo -u smartfactory /opt/smart-factory-edge/raspberry-pi/.venv/bin/pip install -r /opt/smart-factory-edge/raspberry-pi/requirements.txt
 sudo install -d -o root -g smartfactory -m 0750 /etc/smart-factory-iot
 sudo install -o root -g smartfactory -m 0640 .env /etc/smart-factory-iot/edge.env
 sudo install -o root -g smartfactory -m 0640 systemd/smart-factory-edge.service /etc/systemd/system/smart-factory-edge.service
@@ -97,8 +97,8 @@ rsync -av --exclude='.env' --exclude='*.env' --exclude='.venv/' --exclude='__pyc
 On the Pi, copy staged source over the installed source; this leaves its `.env` and `.venv` intact:
 
 ```bash
-sudo cp -a /tmp/smart-factory-edge/raspberry-pi/. /opt/smart-factory-iot-edge/raspberry-pi/
-sudo chown -R smartfactory:smartfactory /opt/smart-factory-iot-edge/raspberry-pi/src
+sudo cp -a /tmp/smart-factory-edge/raspberry-pi/. /opt/smart-factory-edge/raspberry-pi/
+sudo chown -R smartfactory:smartfactory /opt/smart-factory-edge/raspberry-pi/src
 sudo systemctl restart smart-factory-edge
 sudo journalctl -u smart-factory-edge -n 100 --no-pager
 ```
@@ -168,15 +168,15 @@ For a workstation integration run, start services in this order from separate te
 
 ```bash
 # Dashboard repository: PostgreSQL, Redis, Nginx, BaSyx repositories and registries
-cd ../smart-factory-iot-frontend
+cd ../smart-factory-frontend
 docker compose --profile aas up -d --build --wait
 
 # Backend repository: backend PostgreSQL, RabbitMQ (AMQP/MQTT), and .NET services
-cd ../smart-factory-iot-backend
+cd ../smart-factory-backend
 docker compose up -d --build --wait
 
 # Edge repository: run the gateway simulator from raspberry-pi/
-cd ../smart-factory-iot-edge/raspberry-pi
+cd ../smart-factory-edge/raspberry-pi
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python src/sensor_gateway.py
@@ -216,7 +216,7 @@ The disabled-by-default [passive collector](../docs/cybersecurity-collector.md) 
 
 ## MQTT topic identity and acquisition context
 
-Canonical payload and registered IDs are unchanged. Topic levels use `mqtt-topic-v1`: a literal dot is `%2E`, so `sensor.temp:01` publishes under `sensor%2Etemp:01`. Colons are preserved. Only the dot escape is decoded; wildcard, slash, nested and other escapes are rejected. Encoded routes are bounded to 255 bytes. The gateway normalizes older raw-dot Mosquitto topics and persisted spool routes on forwarding without rewriting acquisition JSON. Review exact publisher and device-specific ACL routes during commissioning; this release does not change a factory broker or ACL. See the [telemetry contract](https://github.com/DruHustle/smart-factory-iot-frontend/blob/main/docs/telemetry-contract.md).
+Canonical payload and registered IDs are unchanged. Topic levels use `mqtt-topic-v1`: a literal dot is `%2E`, so `sensor.temp:01` publishes under `sensor%2Etemp:01`. Colons are preserved. Only the dot escape is decoded; wildcard, slash, nested and other escapes are rejected. Encoded routes are bounded to 255 bytes. The gateway normalizes older raw-dot Mosquitto topics and persisted spool routes on forwarding without rewriting acquisition JSON. Review exact publisher and device-specific ACL routes during commissioning; this release does not change a factory broker or ACL. See the [telemetry contract](https://github.com/DruHustle/smart-factory-frontend/blob/main/docs/telemetry-contract.md).
 
 Pi-local ingress requires MQTT 5 with persistent sessions and Retain As Published subscriptions. Only actual subscription acknowledgements establish verified transport context; disconnects clear it. Local publisher JSON cannot assert that flag. Retained, old or unverified deliveries remain historical downstream, including when an MQTT 5 cloud subscriber receives them. The durable queue retains original acquisition identity across retries.
 
