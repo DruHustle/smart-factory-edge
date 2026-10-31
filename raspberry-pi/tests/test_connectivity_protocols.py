@@ -19,6 +19,7 @@ import uuid
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from connectivity_schema import validate_connection
 from connectivity_values import LocalCommissioning, utc_now
 from fx_tsn import decode_uadp, fx_model_snapshot
 from industrial_drivers import MqttDriver, ModbusDriver, OpcUaDriver, UadpDriver
@@ -58,7 +59,7 @@ class ProtocolIntegrationTests(unittest.TestCase):
         cls.environment.stop()
 
     def driver(self, cls, config):
-        driver = cls(copy.deepcopy(config), LocalCommissioning({}))
+        driver = cls(validate_connection(config), LocalCommissioning({}))
         self.addCleanup(driver.close)
         driver.connect()
         return driver

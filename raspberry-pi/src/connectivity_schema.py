@@ -26,7 +26,7 @@ REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", re.ASCII)
 PROPERTY = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", re.ASCII)
 INTERFACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}", re.ASCII)
 SAFE_INTEGER = 9007199254740991
-REGISTER_COUNTS = {"int16": 1, "uint16": 1, "int32": 2, "uint32": 2, "float32": 2, "int64": 4, "uint64": 4, "float64": 4}
+REGISTER_COUNTS = {"boolean": 1, "int16": 1, "uint16": 1, "int32": 2, "uint32": 2, "float32": 2, "int64": 4, "uint64": 4, "float64": 4}
 
 
 def fail(code):

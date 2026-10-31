@@ -65,6 +65,20 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_connection(connection("modbus_rtu", endpoint="serial:///dev/../etc/passwd"))
 
+    def test_boolean_register_configuration_uses_one_register(self):
+        for protocol in ("modbus_tcp", "modbus_rtu"):
+            for table in ("holding_register", "input_register"):
+                with self.subTest(protocol=protocol, table=table):
+                    configured = connection(protocol, tags=[tag("boolean", source={
+                        "address": 65535, "registerType": table, "unitId": 1,
+                    })])
+                    self.assertEqual(validate_connection(configured), configured)
+                    configured["tags"][0]["source"]["count"] = 1
+                    self.assertEqual(validate_connection(configured), configured)
+                    configured["tags"][0]["source"]["count"] = 2
+                    with self.assertRaises(ValueError):
+                        validate_connection(configured)
+
     def test_stable_node_ids_and_serial_ownership(self):
         good = connection("opcua")
         validate_connection(good)
