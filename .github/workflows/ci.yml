@@ -19,10 +19,23 @@ jobs:
           python -m pip install pip-audit==2.10.1
           python -m pip_audit -r raspberry-pi/requirements.txt --strict --progress-spinner off
       - run: PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s raspberry-pi/tests -v
-      - name: Verify MQTT outage and restart recovery with a real broker
+      - name: Verify industrial protocols and MQTT outage recovery with a real broker
         run: |
           printf '%s\n' 'listener 1883 0.0.0.0' 'allow_anonymous true' 'persistence false' > "$RUNNER_TEMP/mosquitto.conf"
           docker run --detach --rm --name telemetry-test -p 127.0.0.1:18884:1883 -v "$RUNNER_TEMP/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto:2.0.22@sha256:199ea8ef2e35ec2b1b37e59cfd1dbae538ed4dfa4a2251a121a52215a6248a21
           trap 'docker stop telemetry-test' EXIT
+          python - <<'PY'
+          import socket, time
+          deadline = time.monotonic() + 15
+          while True:
+              try:
+                  with socket.create_connection(("127.0.0.1", 18884), timeout=1):
+                      break
+              except OSError:
+                  if time.monotonic() >= deadline:
+                      raise
+                  time.sleep(0.1)
+          PY
+          CONNECTIVITY_PROTOCOL_TESTS=1 CONNECTIVITY_TEST_MQTT_PORT=18884 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s raspberry-pi/tests -p 'test_connectivity_protocols.py' -v
           MQTT_TEST_PORT=18884 PYTHONDONTWRITEBYTECODE=1 python raspberry-pi/tests/mqtt_delivery_probe.py
       - run: pio run --project-dir esp32-wrover --environment compile-check

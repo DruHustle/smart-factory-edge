@@ -220,6 +220,39 @@ class GatewaySmokeTests(unittest.TestCase):
         client.on_message(client, None, message)
         self.assertEqual(json.loads(client.published[-1][1])["status"], "rejected")
 
+    def test_industrial_configuration_has_its_own_retained_route(self):
+        sensor_gateway = importlib.import_module("sensor_gateway")
+        settings = types.SimpleNamespace(mqtt_client_id="pi-edge-01", mqtt_username="", mqtt_password="", mqtt_use_tls=False, mqtt_ca_cert="", site_id="factory-a", line_id="line-1", device_id="pi-edge-01")
+        applied, probes = [], []
+        client = sensor_gateway.make_mqtt_client(settings, apply_connectivity=lambda profile: applied.append(profile) or {"configurationRevision": profile["revision"]}, probe_connectivity=lambda request: probes.append(request) or {"commandId": request["commandId"], "status": "queued"})
+        base = sensor_gateway.command_topic(settings.site_id, settings.line_id, settings.device_id)
+        client.on_connect(client, None, None, 0)
+        self.assertEqual(set(client.subscribed), {base, base + "/connectivity"})
+        profile = {"schemaVersion": "industrial-connectivity/v1", "gatewayDeviceId": "pi-edge-01", "revision": 2, "connections": []}
+        payload = json.dumps({"action": "replace_connectivity_configuration", "configuration": profile}).encode()
+        client.on_message(client, None, types.SimpleNamespace(topic=base, payload=payload, retain=True))
+        self.assertEqual(applied, [])
+        client.on_message(client, None, types.SimpleNamespace(topic=base + "/connectivity", payload=payload, retain=True))
+        self.assertEqual(applied, [profile])
+        self.assertEqual(json.loads(client.published[-1][1])["configurationRevision"], 2)
+        self.assertEqual(client.published[-1][0], base + "/ack")
+        probe = json.dumps({"action": "probe_connectivity", "commandId": "probe-test"}).encode()
+        for topic, retained in ((base, True), (base + "/connectivity", False)):
+            client.on_message(client, None, types.SimpleNamespace(topic=topic, payload=probe, retain=retained))
+        self.assertEqual(probes, [])
+        client.on_message(client, None, types.SimpleNamespace(topic=base, payload=probe, retain=False))
+        self.assertEqual(len(probes), 1)
+
+    def test_industrial_duplicate_command_fields_fail_before_application(self):
+        sensor_gateway = importlib.import_module("sensor_gateway")
+        settings = types.SimpleNamespace(mqtt_client_id="pi-edge-01", mqtt_username="", mqtt_password="", mqtt_use_tls=False, mqtt_ca_cert="", site_id="factory-a", line_id="line-1", device_id="pi-edge-01")
+        applied = []
+        client = sensor_gateway.make_mqtt_client(settings, apply_connectivity=lambda profile: applied.append(profile) or {})
+        route = sensor_gateway.command_topic(settings.site_id, settings.line_id, settings.device_id) + "/connectivity"
+        client.on_message(client, None, types.SimpleNamespace(topic=route, payload=b'{"action":"replace_connectivity_configuration","configuration":{"revision":1,"revision":2}}', retain=True))
+        self.assertEqual(applied, [])
+        self.assertEqual(json.loads(client.published[-1][1])["status"], "rejected")
+
     def test_gateway_routes_v2_ada031_profile_command(self):
         sensor_gateway = importlib.import_module("sensor_gateway")
         settings = types.SimpleNamespace(

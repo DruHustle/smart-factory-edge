@@ -16,6 +16,7 @@ The Pi polls OPC UA, Modbus TCP/RTU, and serial JSON equipment, exchanges allowl
 ## Device guides
 
 - [Raspberry Pi gateway](raspberry-pi/README.md): install, hardened systemd service, TLS, industrial protocol security, mapping, safe code upload, and troubleshooting.
+- [Industrial device connectivity](docs/industrial-connectivity.md): independent typed tags, OPC UA subscriptions, Modbus, MQTT JSON, OPC UA FX/UADP observation, TSN evidence, configuration and real protocol tests.
 - [ADA031 V4 integration guide](docs/ada031-integration.md): official stock command bytes, USB serial profile, allowlist, startup motion, temporary code clamps, and feedback limitations.
 - [ADA031 V4 robotic-arm firmware](robotic-arm/README.md): Arduino Uno controller source, calibrated poses, build, and upload instructions.
 - [ESP32 WROVER firmware](esp32-wrover/README.md): configure, build, flash, TLS trust, and broker ACLs.

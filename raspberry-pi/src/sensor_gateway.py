@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import signal
 import sys
 import time
@@ -356,7 +357,7 @@ def connect_local_mqtt(client,settings):
     client.connect(settings.local_mqtt_host,settings.local_mqtt_port,keepalive=60,clean_start=False,properties=properties)
 
 
-def make_mqtt_client(settings, apply_configuration=None, relay_control=None, relay_ada031_control=None):
+def make_mqtt_client(settings, apply_configuration=None, relay_control=None, relay_ada031_control=None, apply_connectivity=None, probe_connectivity=None):
     client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
                          client_id=settings.mqtt_client_id, clean_session=False)
     if settings.mqtt_username:
@@ -365,30 +366,54 @@ def make_mqtt_client(settings, apply_configuration=None, relay_control=None, rel
         client.tls_set(ca_certs=settings.mqtt_ca_cert or None)
 
     expected_topic = command_topic(settings.site_id, settings.line_id, settings.device_id)
+    connectivity_topic = encoded_topic(settings.site_id, settings.line_id, settings.device_id, "commands/connectivity")
+
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Command contains duplicate fields")
+            result[key] = value
+        return result
 
     def on_connect(_client, _userdata, _flags, rc, _properties=None):
         if rc == 0:
             print("[MQTT] connected")
             _client.subscribe(expected_topic, qos=1)
+            _client.subscribe(connectivity_topic, qos=1)
         else:
             print(f"[MQTT] connect failed rc={rc}")
 
     def on_message(_client, _userdata, msg):
         ack = {"deviceId": settings.device_id, "status": "rejected", "timestamp": int(time.time() * 1000)}
         try:
-            if msg.topic != expected_topic:
+            if msg.topic not in {expected_topic, connectivity_topic}:
                 raise ValueError("Command topic does not match this gateway")
             if len(msg.payload) > 64 * 1024:
                 raise ValueError("Command payload exceeds the supported size")
-            command = json.loads(msg.payload.decode("utf-8", errors="strict"))
+            command = json.loads(msg.payload.decode("utf-8", errors="strict"), object_pairs_hook=unique_fields)
             if not isinstance(command, dict):
                 raise ValueError("Command must be a JSON object")
+            # Separate retained desired-state documents must never overwrite
+            # each other. Probes and physical commands use the original route.
+            if (command.get("action") == "replace_connectivity_configuration") != (msg.topic == connectivity_topic):
+                raise ValueError("Command action does not match the authorized route")
             if command.get("action") == "replace_asset_configuration":
                 profile = command.get("configuration")
                 if not isinstance(profile, dict) or apply_configuration is None:
                     raise ValueError("Gateway configuration handler is unavailable")
                 ack["configurationHash"] = apply_configuration(profile)
                 ack["status"] = "applied"
+            elif command.get("action") == "replace_connectivity_configuration":
+                if set(command) != {"action", "configuration"} or apply_connectivity is None or not isinstance(command.get("configuration"), dict):
+                    raise ValueError("Connectivity configuration handler is unavailable")
+                ack.update(apply_connectivity(command["configuration"]))
+                ack.update(status="applied", action="replace_connectivity_configuration")
+            elif command.get("action") == "probe_connectivity":
+                if getattr(msg, "retain", False) or probe_connectivity is None:
+                    raise ValueError("Connectivity probes require a live non-retained request")
+                ack.update(probe_connectivity(command))
+                ack["action"] = "probe_connectivity"
             elif command.get("action") == "set_gpio":
                 if getattr(msg, "retain", False):
                     raise ValueError("GPIO control messages must not be retained")
@@ -580,8 +605,21 @@ def main():
     security_collector=SecurityCollector.from_environment(state)
     settings._security_collector=security_collector
     ada031_commands = Ada031SerialCommandManager(command_state=state)
+    connectivity_runtime = None
 
     def apply_configuration(profile):
+        if connectivity_runtime:
+            from asset_adapters import validate_asset_profile
+            from connectivity_schema import endpoint_resource
+            from urllib.parse import urlparse
+            assets = validate_asset_profile(profile, settings.device_id)
+            serial_paths = {os.path.realpath(urlparse(a["endpoint"]).path) for a in assets if a["protocol"] in {"serial", "modbus_rtu", "ada031_v4_serial"}}
+            if serial_paths & connectivity_runtime.serial_paths():
+                raise ValueError("Serial port is owned by industrial connectivity")
+            with connectivity_runtime.lock:
+                endpoints = {endpoint_resource(c["endpoint"]) for c in connectivity_runtime.configuration["connections"] if c["enabled"] and c["protocol"] in {"opcua", "opcua_fx", "modbus_tcp"}}
+            if {endpoint_resource(a["endpoint"]) for a in assets if a["protocol"] in {"opcua", "modbus_tcp"}} & endpoints:
+                raise ValueError("Endpoint is owned by industrial connectivity")
         digest = save_asset_profile(settings.asset_config_file, profile, settings.device_id)
         with configuration_lock:
             asset_connections[:] = load_asset_connections(settings.asset_config_file, settings.device_id)
@@ -616,7 +654,17 @@ def main():
         with serial_io_lock:
             return ada031_commands.execute(asset, normalized, command_byte)
 
-    client = make_mqtt_client(settings, apply_configuration, relay_control, relay_ada031_control)
+    def apply_connectivity(configuration):
+        if connectivity_runtime is None:
+            raise ValueError("Connectivity runtime is unavailable")
+        return connectivity_runtime.apply(configuration)
+
+    def probe_connectivity(command):
+        if connectivity_runtime is None:
+            raise ValueError("Connectivity runtime is unavailable")
+        return connectivity_runtime.queue_probe(command)
+
+    client = make_mqtt_client(settings, apply_configuration, relay_control, relay_ada031_control, apply_connectivity, probe_connectivity)
     publisher = DurablePublisher(client, state) if state else client
     if security_collector:
         Thread(target=security_collector.run,args=(STOP,client),daemon=True).start()
@@ -642,12 +690,39 @@ def main():
             payload["assetId"] = data["assetId"]
         if isinstance(data.get("assetSignals"), dict):
             payload["assetSignals"] = data["assetSignals"]
+        if isinstance(data.get("connectivity"), dict):
+            payload["connectivity"] = data["connectivity"]
         topic = telemetry_topic(settings.site_id, settings.line_id, settings.device_id)
-        result = publisher.publish(topic, json.dumps(payload), qos=1)
+        result = publisher.publish(topic, json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False), qos=1)
         if getattr(result, "rc", 0) != 0:
+            if "connectivity" in payload:
+                raise RuntimeError("connectivity_delivery_unavailable")
             print("[DELIVERY] Telemetry could not be queued; investigate gateway storage/uplink")
         else:
             print(f"[MQTT] telemetry queued -> {topic}")
+
+    def legacy_serial_paths():
+        from urllib.parse import urlparse
+        with configuration_lock:
+            paths = {os.path.realpath(urlparse(a["endpoint"]).path) for a in asset_connections if a["protocol"] in {"serial", "modbus_rtu", "ada031_v4_serial"}}
+        if settings.serial_enabled:
+            paths.add(os.path.realpath(settings.serial_port))
+        return paths
+
+    def legacy_connections():
+        with configuration_lock:
+            return {a["endpoint"] for a in asset_connections if a["protocol"] in {"opcua", "modbus_tcp"}}
+
+    try:
+        from industrial_connectivity import ConnectivityRuntime
+        from pathlib import Path
+        connectivity_runtime = ConnectivityRuntime(
+            os.getenv("CONNECTIVITY_CONFIG_FILE", str(Path(settings.asset_config_file).with_name("connectivity.json"))),
+            settings.device_id, publish_telemetry, STOP, serial_io_lock,
+            legacy_serial_paths, state, legacy_connections=legacy_connections,
+        )
+    except Exception:
+        print("[CONNECTIVITY] local configuration unavailable; legacy acquisition preserved")
 
     def sig_handler(_sig, _frame):
         STOP.set()
@@ -681,6 +756,11 @@ def main():
     )
     asset_thread.start()
 
+    connectivity_thread = None
+    if connectivity_runtime is not None:
+        connectivity_thread = Thread(target=connectivity_runtime.run, daemon=True)
+        connectivity_thread.start()
+
     hb_thread = Thread(target=heartbeat_loop, args=(settings, client), daemon=True)
     hb_thread.start()
 
@@ -709,6 +789,8 @@ def main():
     client.loop_stop()
     client.disconnect()
     workers = [serial_thread, asset_thread, hb_thread]
+    if connectivity_thread is not None:
+        workers.append(connectivity_thread)
     if delivery_thread is not None:
         workers.append(delivery_thread)
     for worker in workers:
