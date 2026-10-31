@@ -105,6 +105,24 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(sample(tag("boolean"), True)["value"], True)
         self.assertEqual(sample(tag("string"), "running")["value"], "running")
 
+    def test_good_null_values_become_bad_samples_instead_of_invalid_reports(self):
+        for kind in ("boolean", "string", "float32", "float64", "int16", "uint64"):
+            with self.subTest(kind=kind):
+                missing = sample(tag(kind), None, quality="good", native_status="mqtt_message", basis="payload")
+                self.assertIsNone(missing["value"])
+                self.assertEqual(missing["quality"], "bad")
+                self.assertEqual(missing["nativeStatus"], "source_value_missing")
+                self.assertEqual(missing["qualityBasis"], "payload")
+        # A waiting source may still report an explicitly unknown null value.
+        self.assertEqual(sample(tag(), None)["quality"], "unknown")
+
+    def test_opcua_string_ids_use_the_full_existing_512_character_budget(self):
+        value = connection("opcua")
+        value["tags"][0]["source"] = {"nodeId": "ns=2;s=" + "x" * 505}
+        validate_connection(value)
+        value["tags"][0]["source"] = {"nodeId": "s=" + "x" * 510, "namespaceUri": "urn:smartfactory:bench"}
+        validate_connection(value)
+
     def test_atomic_persistence_and_duplicate_json_detection(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "config.json"

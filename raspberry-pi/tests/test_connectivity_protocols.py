@@ -84,6 +84,21 @@ class ProtocolIntegrationTests(unittest.TestCase):
         self.assertEqual(opcua["pressure"], 12.5)
         self.assertEqual(opcua["mapping"]["pressure"]["rawUnit"], "native")
 
+    def test_real_modbus_boolean_registers_preserve_zero_and_nonzero_values(self):
+        config = copy.deepcopy(self.connections["modbus-bench"])
+        config["tags"] = [
+            tag("boolean", "holding-on", {"address": 0, "registerType": "holding_register", "unitId": 1}),
+            tag("boolean", "holding-off", {"address": 1, "registerType": "holding_register", "unitId": 1}),
+            tag("boolean", "input-on", {"address": 0, "registerType": "input_register", "unitId": 1}),
+        ]
+        result = self.driver(ModbusDriver, config).collect()
+        values = {item["tagId"]: item for item in result["tags"]}
+        self.assertIs(values["holding-on"]["value"], True)
+        self.assertIs(values["holding-off"]["value"], False)
+        self.assertIs(values["input-on"]["value"], True)
+        self.assertTrue(all(item["quality"] == "unknown" for item in values.values()))
+        self.assertEqual(result["state"], "connected")
+
     @unittest.skipUnless(os.name == "posix", "Pseudo-terminal RTU fixture requires POSIX")
     def test_real_modbus_rtu_over_commissioned_pseudo_terminal(self):
         import pty
@@ -189,6 +204,10 @@ class ProtocolIntegrationTests(unittest.TestCase):
         self.bench.mqtt.publish(topic, json.dumps({"value": 20.5, "quality": "good", "time": utc_now()}), qos=1).wait_for_publish(3)
         live = until(lambda: driver.collect()["tags"][0] if driver.collect()["tags"][0]["value"] == 20.5 else None)
         self.assertEqual(live["quality"], "good")
+        self.bench.mqtt.publish(topic, json.dumps({"value": None, "quality": "good", "time": utc_now()}), qos=1).wait_for_publish(3)
+        missing = until(lambda: driver.collect()["tags"][0] if driver.collect()["tags"][0].get("nativeStatus") == "source_value_missing" else None)
+        self.assertIsNone(missing["value"])
+        self.assertEqual(missing["quality"], "bad")
         self.bench.mqtt.publish(topic, '{"value":1,"value":2}', qos=1).wait_for_publish(3)
         invalid = until(lambda: driver.collect()["tags"][0] if driver.collect()["tags"][0].get("nativeStatus") == "mqtt_payload_invalid" else None)
         self.assertEqual(invalid["quality"], "bad")
