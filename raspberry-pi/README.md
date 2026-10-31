@@ -80,7 +80,7 @@ Copy `.env.example` to `/etc/smart-factory-iot/edge.env` and keep `EDGE_ENV=prod
 
 ## systemd install
 
-Use a dedicated unprivileged `smartfactory` service account. Keep secrets under `/etc/smart-factory-iot/`, owned by root and readable only by the service group. The unit uses the app's virtual environment, `dialout` for serial hardware, and systemd hardening.
+Use a dedicated unprivileged `smartfactory` service account. Keep environment files and TLS credentials under `/etc/smart-factory-iot/`, owned by root and readable only by the service group. The separate `CONNECTIVITY_SECRETS_FILE` JSON requires mode `0600` and must be owned by the service account so it can read it; group-readable JSON is rejected. The unit uses the app's virtual environment, `dialout` for serial hardware, and systemd hardening.
 
 ```bash
 sudo useradd --system --home-dir /opt/smart-factory-edge --shell /usr/sbin/nologin --groups dialout smartfactory
@@ -99,24 +99,84 @@ Check logs with `journalctl -u smart-factory-edge -n 100 --no-pager`. If the acc
 
 ## Safe Pi code upload
 
-Run from the edge repository root on your development computer. Review the dry-run, then upload Pi code into a staging directory. Never use `rsync --delete`:
+First inspect the actual commissioned unit, including its overrides:
+
+```bash
+sudo systemctl cat smart-factory-edge
+sudo systemctl show smart-factory-edge --property=ExecStart --property=WorkingDirectory
+```
+
+An existing `40-telemetry.conf` or `60-gateway-release.conf` can point `ExecStart` at a staged release, including a legacy installation path. Copying files to `/opt/smart-factory-edge/raspberry-pi/src` does not update that active release. Use the [staged release procedure](#staged-gateway-release) for this connectivity release and for any dependency change. Do not remove an existing override or overwrite its environment files to force the base path to run.
+
+For an initial source upload or a reviewed source-only change whose effective `ExecStart` uses the base directory below, run these commands from the edge repository root on your development computer. Review the dry-run, then upload Pi code and its shared test fixtures into a staging directory. Never use `rsync --delete`:
 
 ```bash
 ssh DEPLOY_USER@PI_IP 'mkdir -p /tmp/smart-factory-edge/raspberry-pi'
 rsync -av --dry-run --exclude='.env' --exclude='*.env' --exclude='.venv/' --exclude='__pycache__/' --exclude='*.pyc' --exclude='.DS_Store' raspberry-pi/ DEPLOY_USER@PI_IP:/tmp/smart-factory-edge/raspberry-pi/
 rsync -av --exclude='.env' --exclude='*.env' --exclude='.venv/' --exclude='__pycache__/' --exclude='*.pyc' --exclude='.DS_Store' raspberry-pi/ DEPLOY_USER@PI_IP:/tmp/smart-factory-edge/raspberry-pi/
+rsync -av --dry-run fixtures/ DEPLOY_USER@PI_IP:/tmp/smart-factory-edge/fixtures/
+rsync -av fixtures/ DEPLOY_USER@PI_IP:/tmp/smart-factory-edge/fixtures/
 ```
 
 On the Pi, copy staged source over the installed source; this leaves its `.env` and `.venv` intact:
 
 ```bash
 sudo cp -a /tmp/smart-factory-edge/raspberry-pi/. /opt/smart-factory-edge/raspberry-pi/
+sudo install -d -o root -g smartfactory -m 0750 /opt/smart-factory-edge/fixtures
+sudo cp -a /tmp/smart-factory-edge/fixtures/. /opt/smart-factory-edge/fixtures/
 sudo chown -R smartfactory:smartfactory /opt/smart-factory-edge/raspberry-pi/src
 sudo systemctl restart smart-factory-edge
 sudo journalctl -u smart-factory-edge -n 100 --no-pager
 ```
 
-Back up `/etc/smart-factory-iot/edge.env`, Mosquitto credentials/ACLs and certificates, chrony configuration, and machine profile separately. The rsync steps transfer only Python gateway source; they do not configure the broker or provision sensor firmware.
+Back up `/etc/smart-factory-iot/edge.env`, any `telemetry.env`, connectivity secrets, Mosquitto credentials/ACLs and certificates, chrony configuration, and both `assets.json` and `connectivity.json` separately. Take a consistent delivery-queue snapshot using SQLite's backup API or while the gateway is stopped. The upload transfers source and test fixtures; it does not configure the broker or provision sensor firmware.
+
+## Staged gateway release
+
+Gateway software is deployed separately from the Oracle API/worker image. `EDGE_SOURCE_REVISION` in that image records a source pin; it does not install software on a Pi. Qualify the compatible API and worker first, then install the reviewed edge commit on each commissioned gateway and verify its real observations.
+
+Build the bundle from the reviewed committed tree on a build host with the commissioned Pi's Python version, CPU architecture and compatible OS wheel tags. The current dependency lock targets CPython 3.11. The wheel download below requires binary artifacts for that host; a development machine's wheelhouse is not automatically suitable for ARM64. Existing plant secrets and state must not be added to the bundle.
+
+```bash
+release_revision="$(git rev-parse HEAD)"
+release_bundle="$(mktemp -d /tmp/smart-factory-gateway.XXXXXX)"
+git archive "$release_revision" raspberry-pi/src raspberry-pi/tests raspberry-pi/examples raspberry-pi/scripts raspberry-pi/requirements.txt fixtures | tar -x -C "$release_bundle"
+cp "$release_bundle/raspberry-pi/scripts/install-telemetry-release.py" "$release_bundle/install-telemetry-release.py"
+printf '%s\n' "$release_revision" > "$release_bundle/SOURCE_REVISION"
+python3.11 -m pip download --require-hashes --only-binary=:all: -r "$release_bundle/raspberry-pi/requirements.txt" --dest "$release_bundle/wheels"
+python3 - "$release_bundle" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+bundle = Path(sys.argv[1])
+files = sorted(path for path in bundle.rglob("*") if path.is_file() and path != bundle / "SHA256SUMS")
+(bundle / "SHA256SUMS").write_text("".join(
+    f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(bundle).as_posix()}\n"
+    for path in files
+))
+PY
+ssh DEPLOY_USER@PI_IP "mkdir -p /tmp/smart-factory-gateway-$release_revision"
+rsync -av --dry-run "$release_bundle/" "DEPLOY_USER@PI_IP:/tmp/smart-factory-gateway-$release_revision/"
+rsync -av "$release_bundle/" "DEPLOY_USER@PI_IP:/tmp/smart-factory-gateway-$release_revision/"
+```
+
+On the Pi, inspect `systemctl cat` and the effective `ExecStart` as above, compare `SOURCE_REVISION` with the approved full commit, and run the installer from that bundle, substituting the commit in the path:
+
+```bash
+sudo python3 /tmp/smart-factory-gateway-APPROVED_FULL_COMMIT/install-telemetry-release.py
+sudo systemctl show smart-factory-edge --property=ExecStart --property=WorkingDirectory
+sudo journalctl -u smart-factory-edge -n 100 --no-pager
+```
+
+The installer verifies all bundle checksums, including the shared connectivity and provenance fixtures. It creates `/opt/smart-factory-edge/raspberry-pi/releases/gateway-.../`, retaining `raspberry-pi/` beside `fixtures/`, and copies the virtual environment identified by the current effective `ExecStart`. That active environment may live under a legacy project path; the installer does not assume the base `.venv` is active. It invokes the staged Python directly, installs from the offline wheelhouse with `--require-hashes`, checks resolved versions and dependencies, and runs unit tests as `smartfactory`. The opt-in protocol bench remains a separate qualification and is not run against a commissioned gateway by the installer.
+
+Only after qualification does it write the managed `60-gateway-release.conf`, which changes `ExecStart` alone. Existing unit hardening, `WorkingDirectory`, `40-telemetry.conf`, environment files, their ownership, credentials, asset/connectivity configuration, and the delivery queue remain in place. It rechecks the previous effective command before cutover and the new effective Python/script paths after `daemon-reload`; a later override that wins prevents any restart. Wrappers, additional interpreter arguments, escaped paths or an unmanaged file at the new override path require a reviewed manual cutover. New source and its environment are root-owned and service-group-readable.
+
+The installer prints the staged path and its `rollback.sh`. A failed restart/health check restores the previous managed override, including its owner, group and mode, and restarts the previous command. A failure before the initial restart restores the override without restarting the gateway. Keep prior releases and the root-only rollback state. The rollback script refuses to overwrite a managed override changed by a later release or an operator. A running systemd unit is only a process check: confirm the gateway's applied revision, fresh expected tag values, correct quality/source timestamps and queue recovery through the compatible API before accepting the rollout. Local allowlists, service-readable credentials, exact broker ACLs and TSN collector access still require commissioning; the installer does not alter them.
+
+### Coordinated rollback with connectivity data
+
+Older cloud consumers can strip connectivity fields and acknowledge the remaining telemetry. For a rollback to those versions, stop affected gateways **without changing configuration revision**, keep the compatible API/worker running while the broker and .NET outbox drain, and preserve any remaining edge SQLite queue offline. Publishing an empty newer revision first can invalidate already-buffered observations from the preceding revision. Keep gateways stopped throughout the incompatible cloud rollback; an older gateway process can also replay raw queued envelopes. If the cloud backlog cannot drain, keep the old worker stopped as well. Restore a compatible API/worker before restarting a gateway and replaying retained connectivity observations. The local `rollback.sh` only restores gateway code selection; it does not coordinate this cross-service data barrier or delete queued data.
 
 ## Industrial protocols
 
