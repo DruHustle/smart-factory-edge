@@ -16,7 +16,7 @@ def decode_level(level: str) -> str:
 
 
 def topic(site: str, line: str, device: str, kind: str) -> str:
-    if kind not in {"telemetry", "heartbeat", "commands", "control-ack", "commands/ack"}:
+    if kind not in {"telemetry", "heartbeat", "commands", "commands/connectivity", "control-ack", "commands/ack"}:
         raise ValueError("Unsupported MQTT topic kind")
     value = "/".join(("factory", encode_level(site), encode_level(line), encode_level(device), kind))
     if len(value.encode("ascii")) > 255:

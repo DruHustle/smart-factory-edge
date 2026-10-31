@@ -1,0 +1,21 @@
+# Cloud broker example for one gateway. Use separate production credentials;
+# this file is not the Pi-local sensor broker's ACL. Replace canonical identity
+# segments using mqtt-topic-v1 encoding (periods become %2E).
+user pi-edge-01
+topic write factory/factory-a/line-1/pi-edge-01/telemetry
+topic write factory/factory-a/line-1/pi-edge-01/heartbeat
+topic write factory/factory-a/line-1/pi-edge-01/commands/ack
+topic read factory/factory-a/line-1/pi-edge-01/commands
+topic read factory/factory-a/line-1/pi-edge-01/commands/connectivity
+
+user smartfactory-device-service
+topic write factory/factory-a/line-1/pi-edge-01/commands
+topic write factory/factory-a/line-1/pi-edge-01/commands/connectivity
+topic read factory/factory-a/line-1/pi-edge-01/commands/ack
+
+user smartfactory-telemetry-service
+topic read factory/factory-a/line-1/pi-edge-01/telemetry
+topic read factory/factory-a/line-1/pi-edge-01/heartbeat
+
+# Add only explicitly commissioned forwarded sensor telemetry/heartbeat routes
+# to the gateway publisher and telemetry consumer identities when required.
