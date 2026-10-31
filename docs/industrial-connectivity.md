@@ -146,7 +146,11 @@ the `lo` diagnostics interface are allowed; serial ports still require explicit
 commissioning.
 
 Credentials are referenced with a safe `credentialRef`; secret content remains
-in an owner-only local JSON file, maximum 64 KiB. Its shape is
+in a mode-`0600` local JSON file, maximum 64 KiB, owned by the gateway service
+account (`smartfactory`) so the unprivileged process can read it. The parent
+directory remains protected; the installer preserves existing file ownership.
+Root-owned, group-readable environment files can remain mode `0640`, but that
+mode is rejected for this credentials JSON. Its shape is
 `{"credentials":{...},"collectors":{...}}`. A UA credential entry can contain
 `securityPolicy`, `securityMode`, `clientCertificate`, `clientPrivateKey`,
 `serverCertificate`, `username`, `password`. Production requires
@@ -168,6 +172,16 @@ temporary local client socket and sends only `GET TIME_STATUS_NP`,
 changes the clock, writes a qdisc or programs a switch. Existing daemon socket
 permissions determine which observations are available. Diagnostic commands use
 fixed argv without a shell, bounded output and two-second timeouts.
+
+Install the edge software using the [staged gateway release procedure](../raspberry-pi/README.md#staged-gateway-release),
+which inspects the effective service command, retains both shared fixture trees,
+qualifies the offline hashed dependencies, and preserves commissioned state.
+An Oracle image's `EDGE_SOURCE_REVISION` label does not deploy gateway code.
+For a cloud rollback to consumers without connectivity support, follow the
+[coordinated rollback barrier](../raspberry-pi/README.md#coordinated-rollback-with-connectivity-data):
+stop gateways at their existing revision, drain while compatible services are
+still running, and preserve any residual SQLite queue offline until compatible
+services return.
 
 ## Delivery, revision receipts and probes
 

@@ -44,7 +44,7 @@ Test with a staging broker and bench equipment before a plant rollout.
 
 ## Firmware update support
 
-This edge release has no automated OTA/FOTA agent. The ESP-WROVER firmware has no network update receiver and must be built and flashed over USB using PlatformIO. Raspberry Pi software uses the staged, manual `rsync` deployment procedure in [the gateway guide](raspberry-pi/README.md); it is not updated by the dashboard. The ADA031 V4 Uno is programmed over USB with the project's connected firmware (the official stock sketch remains a deliberate legacy option). The dashboard marks firmware delivery unavailable and its legacy records must not be treated as device update evidence.
+This edge release has no automated OTA/FOTA agent. The ESP-WROVER firmware has no network update receiver and must be built and flashed over USB using PlatformIO. Raspberry Pi software uses the manual [staged gateway release procedure](raspberry-pi/README.md#staged-gateway-release), with an offline hashed wheelhouse, effective systemd command checks and local rollback; it is not updated by the dashboard or by the Oracle image's edge source label. The ADA031 V4 Uno is programmed over USB with the project's connected firmware (the official stock sketch remains a deliberate legacy option). The dashboard marks firmware delivery unavailable and its legacy records must not be treated as device update evidence.
 
 Do not enable remote firmware delivery until a signed release pipeline, hardware compatibility checks, authenticated device acknowledgements, rollback/recovery behavior, and staged rollout tests are in place.
 
