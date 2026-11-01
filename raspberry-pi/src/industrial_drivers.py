@@ -110,7 +110,11 @@ class ModbusDriver(Driver):
                 for tag in plan["tags"]:
                     offset = tag["source"]["address"] - plan["start"]
                     if tag["dataType"] == "boolean":
-                        value = bool(response.bits[offset])
+                        # Boolean tags can be commissioned on register tables
+                        # as well as bit tables. A register uses zero/nonzero;
+                        # only coils and discrete inputs have response.bits.
+                        values = response.bits if plan["key"][1] in {"coil", "discrete_input"} else response.registers
+                        value = bool(values[offset])
                     else:
                         value = self.decode(response.registers[offset:offset + REGISTER_COUNTS[tag["dataType"]]], tag)
                     result.append(sample(tag, value, native_status="read_succeeded_sensor_quality_unknown"))

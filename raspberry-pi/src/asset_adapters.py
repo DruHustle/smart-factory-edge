@@ -86,6 +86,10 @@ def validate_asset_profile(profile: dict, expected_gateway_id: str) -> list[dict
                 raise ValueError("Tag mapping scale must be a finite number")
             if "address" in mapping and (isinstance(mapping["address"], bool) or not isinstance(mapping["address"], int) or not 0 <= mapping["address"] <= 65535):
                 raise ValueError("Modbus address is outside the supported range")
+            if protocol in {"modbus_tcp", "modbus_rtu"}:
+                _modbus_format(mapping, count)
+                if "address" in mapping and mapping["address"] + count > 65536:
+                    raise ValueError("Modbus mapping crosses the register address limit")
             if "nodeId" in mapping and (not isinstance(mapping["nodeId"], str) or len(mapping["nodeId"]) > 512):
                 raise ValueError("OPC UA node id is invalid")
         validated.append({
@@ -141,12 +145,35 @@ def _metric_name(mapping: dict) -> str | None:
     return metric if metric in SUPPORTED_METRICS else None
 
 
+def _modbus_format(mapping: dict, count: int) -> str:
+    """Reject ambiguous legacy mappings instead of silently reading another type."""
+    if type(count) is not int or count not in {1, 2}:
+        raise ValueError("Modbus count must be one or two registers")
+    encoding = str(mapping.get("dataType", "uint16" if count == 1 else "uint32")).lower()
+    widths = {"uint16": 1, "int16": 1, "uint32": 2, "int32": 2, "float32": 2}
+    if widths.get(encoding) != count:
+        raise ValueError("Modbus data type and register count do not match")
+    if str(mapping.get("wordOrder", "big")).lower() not in {"big", "little"}:
+        raise ValueError("Modbus word order must be big or little")
+    if str(mapping.get("registerType", "holding_register")).lower() not in {
+        "holding", "holding_register", "holding_registers", "input", "input_register", "input_registers",
+    }:
+        raise ValueError("Modbus register type is unsupported")
+    for field in ("deviceId", "unitId"):
+        if field in mapping and (type(mapping[field]) is not int or not 0 <= mapping[field] <= 255):
+            raise ValueError("Modbus unit ID must be an integer between 0 and 255")
+    if "deviceId" in mapping and "unitId" in mapping and mapping["deviceId"] != mapping["unitId"]:
+        raise ValueError("Modbus deviceId and unitId conflict")
+    return encoding
+
+
 def _decode_registers(registers: list[int], mapping: dict, raw_value=False) -> float:
-    if not registers:
-        raise ValueError("Modbus returned no registers")
+    encoding = _modbus_format(mapping, mapping.get("count", len(registers)))
+    if len(registers) != mapping.get("count", len(registers)) or any(type(word) is not int or not 0 <= word <= 65535 for word in registers):
+        raise ValueError("Modbus response has invalid or incomplete registers")
     if len(registers) == 1:
         value = registers[0]
-        if mapping.get("dataType") == "int16" and value >= 0x8000:
+        if encoding == "int16" and value >= 0x8000:
             value -= 0x10000
     else:
         words = list(registers)
@@ -155,7 +182,6 @@ def _decode_registers(registers: list[int], mapping: dict, raw_value=False) -> f
         raw = 0
         for word in words:
             raw = (raw << 16) | word
-        encoding = str(mapping.get("dataType", "uint32")).lower()
         if encoding == "float32":
             value = struct.unpack(">f", struct.pack(">I", raw))[0]
         elif encoding == "int32" and raw >= 0x80000000:
@@ -210,7 +236,8 @@ def _read_modbus_mappings(client, mappings: list[dict]) -> dict[str, float]:
         if metric is None or "address" not in mapping:
             continue
         address = int(mapping["address"])
-        count = max(1, min(4, int(mapping.get("count", 1))))
+        count = mapping.get("count", 1)
+        _modbus_format(mapping, count)
         device_id = int(mapping.get("deviceId", mapping.get("unitId", 1)))
         register_type = str(mapping.get("registerType", "holding_register")).lower()
         if register_type in {"input", "input_register", "input_registers"}:
@@ -219,6 +246,8 @@ def _read_modbus_mappings(client, mappings: list[dict]) -> dict[str, float]:
             response = client.read_holding_registers(address, count=count, device_id=device_id)
         if response.isError():
             raise IOError(f"Modbus read failed at register {address}")
+        if len(response.registers) != count:
+            raise ValueError("Modbus response has incomplete registers")
         mapped_value(values, metric, _decode_registers(response.registers, mapping, raw_value=True), mapping, "register")
     return values
 
@@ -307,7 +336,17 @@ class SerialJsonConnectionManager:
         port = self._ports[asset_id][1]
         # Skip vendor startup banners until a JSON record arrives.
         for _ in range(8):
-            raw = port.readline()
+            try:
+                raw = port.readline(MAX_SERIAL_RECORD_BYTES + 1)
+            except OSError:
+                # A USB disconnect leaves a cached descriptor unusable. Release
+                # it so the next poll can reopen the commissioned stable path.
+                self._ports.pop(asset_id, None)
+                try:
+                    port.close()
+                except OSError:
+                    pass
+                raise
             if not raw:
                 continue
             if len(raw) > MAX_SERIAL_RECORD_BYTES:
@@ -380,7 +419,7 @@ def read_serial_json(
     baudrate = int(options.get("baudrate", ["115200"])[0])
     timeout = float(options.get("timeout", ["1"])[0])
     with serial.Serial(parsed.path, baudrate, timeout=timeout) as port:
-        raw = port.readline()
+        raw = port.readline(MAX_SERIAL_RECORD_BYTES + 1)
     if len(raw) > MAX_SERIAL_RECORD_BYTES:
         raise ValueError("Serial JSON record exceeds the supported size")
     if not raw:

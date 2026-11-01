@@ -65,6 +65,20 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_connection(connection("modbus_rtu", endpoint="serial:///dev/../etc/passwd"))
 
+    def test_boolean_register_configuration_uses_one_register(self):
+        for protocol in ("modbus_tcp", "modbus_rtu"):
+            for table in ("holding_register", "input_register"):
+                with self.subTest(protocol=protocol, table=table):
+                    configured = connection(protocol, tags=[tag("boolean", source={
+                        "address": 65535, "registerType": table, "unitId": 1,
+                    })])
+                    self.assertEqual(validate_connection(configured), configured)
+                    configured["tags"][0]["source"]["count"] = 1
+                    self.assertEqual(validate_connection(configured), configured)
+                    configured["tags"][0]["source"]["count"] = 2
+                    with self.assertRaises(ValueError):
+                        validate_connection(configured)
+
     def test_stable_node_ids_and_serial_ownership(self):
         good = connection("opcua")
         validate_connection(good)
@@ -104,6 +118,24 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(sample(tag(), value)["value"], None)
         self.assertEqual(sample(tag("boolean"), True)["value"], True)
         self.assertEqual(sample(tag("string"), "running")["value"], "running")
+
+    def test_good_null_values_become_bad_samples_instead_of_invalid_reports(self):
+        for kind in ("boolean", "string", "float32", "float64", "int16", "uint64"):
+            with self.subTest(kind=kind):
+                missing = sample(tag(kind), None, quality="good", native_status="mqtt_message", basis="payload")
+                self.assertIsNone(missing["value"])
+                self.assertEqual(missing["quality"], "bad")
+                self.assertEqual(missing["nativeStatus"], "source_value_missing")
+                self.assertEqual(missing["qualityBasis"], "payload")
+        # A waiting source may still report an explicitly unknown null value.
+        self.assertEqual(sample(tag(), None)["quality"], "unknown")
+
+    def test_opcua_string_ids_use_the_full_existing_512_character_budget(self):
+        value = connection("opcua")
+        value["tags"][0]["source"] = {"nodeId": "ns=2;s=" + "x" * 505}
+        validate_connection(value)
+        value["tags"][0]["source"] = {"nodeId": "s=" + "x" * 510, "namespaceUri": "urn:smartfactory:bench"}
+        validate_connection(value)
 
     def test_atomic_persistence_and_duplicate_json_detection(self):
         with tempfile.TemporaryDirectory() as directory:

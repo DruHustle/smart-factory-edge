@@ -74,6 +74,10 @@ def sample(tag, value=None, quality="unknown", native_status=None, source_timest
         result["unit"] = tag["unit"]
     if native_status:
         result["nativeStatus"] = str(native_status)[:128]
+    if value is None and quality == "good":
+        # Preserve the affected tag as a bad sample. A good/null pair violates
+        # both cloud consumers' wire contract and would reject the whole batch.
+        result.update(quality="bad", nativeStatus="source_value_missing")
     if quality != "bad" and value is not None:
         try:
             result["value"] = normalize_value(tag, value)

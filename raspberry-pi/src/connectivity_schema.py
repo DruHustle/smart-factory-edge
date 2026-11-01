@@ -26,7 +26,7 @@ REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", re.ASCII)
 PROPERTY = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", re.ASCII)
 INTERFACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}", re.ASCII)
 SAFE_INTEGER = 9007199254740991
-REGISTER_COUNTS = {"int16": 1, "uint16": 1, "int32": 2, "uint32": 2, "float32": 2, "int64": 4, "uint64": 4, "float64": 4}
+REGISTER_COUNTS = {"boolean": 1, "int16": 1, "uint16": 1, "int32": 2, "uint32": 2, "float32": 2, "int64": 4, "uint64": 4, "float64": 4}
 
 
 def fail(code):
@@ -226,9 +226,9 @@ def validate_connection(value):
             text(source["nodeId"], 512)
             if "namespaceUri" in source:
                 text(source["namespaceUri"], 256)
-                if not re.fullmatch(r"(?:i=[0-9]{1,10}|s=.{1,500}|g=[0-9a-fA-F-]{36}|b=[A-Za-z0-9+/=]+)", source["nodeId"]):
+                if not re.fullmatch(r"(?:i=[0-9]{1,10}|s=.{1,510}|g=[0-9a-fA-F-]{36}|b=[A-Za-z0-9+/=]+)", source["nodeId"]):
                     fail("stable_node_id")
-            elif not re.fullmatch(r"(?:ns=[0-9]{1,5};)?(?:i=[0-9]{1,10}|s=.{1,500}|g=[0-9a-fA-F-]{36}|b=[A-Za-z0-9+/=]+)", source["nodeId"]):
+            elif not re.fullmatch(r"(?:ns=[0-9]{1,5};)?(?:i=[0-9]{1,10}|s=.{1,510}|g=[0-9a-fA-F-]{36}|b=[A-Za-z0-9+/=]+)", source["nodeId"]):
                 fail("node_id")
         elif value["protocol"] in {"modbus_tcp", "modbus_rtu"}:
             fields(source, {"address", "registerType", "unitId"}, {"count", "byteOrder", "wordOrder"})
