@@ -704,7 +704,7 @@ class AssetAdapterTests(unittest.TestCase):
                 ]
                 self.closed = False
 
-            def readline(self):
+            def readline(self, size=-1):
                 return self.lines.pop(0) if self.lines else b""
 
             def close(self):
