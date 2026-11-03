@@ -50,6 +50,7 @@ class DurableStateTests(unittest.TestCase):
             state.close()
             state = DurableState(path)
             self.assertEqual(state.first_with_qos(), (identity, "test", "payload", 1))
+            self.assertEqual(state._db.execute("SELECT count(*) FROM telemetry_qos").fetchone()[0], 0)
             state.close()
 
     def test_old_dotted_topics_reopen_and_publish_without_renaming_evidence(self):

@@ -22,6 +22,8 @@ class DurableState:
         # Separate metadata preserves compatibility with the previous release's
         # four-column telemetry table and its rollback INSERT statements.
         self._db.execute("CREATE TABLE IF NOT EXISTS telemetry_qos (id TEXT PRIMARY KEY, queued_at REAL NOT NULL, qos INTEGER NOT NULL CHECK(qos BETWEEN 0 AND 2))")
+        # A prior release can remove queued rows without knowing this table.
+        self._db.execute("DELETE FROM telemetry_qos WHERE NOT EXISTS (SELECT 1 FROM telemetry WHERE telemetry.id=telemetry_qos.id AND telemetry.queued_at=telemetry_qos.queued_at)")
         self._db.execute("CREATE INDEX IF NOT EXISTS telemetry_queue_order ON telemetry (queued_at)")
         self._db.execute("CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, expires_at REAL NOT NULL)")
         self._db.commit()
