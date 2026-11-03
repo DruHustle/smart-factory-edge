@@ -274,7 +274,7 @@ def relay_qos_configuration(settings, local_client, command: dict) -> dict:
     return {"commandId": identity, "targetDeviceId": target, "status": "queued"}
 
 
-def forward_local_control_ack(settings, cloud_client, msg) -> bool:
+def forward_local_control_ack(settings, cloud_client, msg, transport_verified=False) -> bool:
     """Forward a WROVER acknowledgement to the gateway's scoped cloud ack topic."""
     parts = msg.topic.split("/")
     if len(parts)!=5 or parts[0]!="factory" or parts[4]!="control-ack":return False
@@ -301,7 +301,7 @@ def forward_local_control_ack(settings, cloud_client, msg) -> bool:
         return False
     if ack.get("action") == "configure_mqtt_qos":
         required = {"action", "deviceId", "commandId", "status", "timestamp", "revision", "uplinkQos", "downlinkQos"}
-        if getattr(msg, "retain", False) or not required.issubset(ack) or set(ack) - required - {"reason"}:
+        if not transport_verified or getattr(msg, "retain", False) or not required.issubset(ack) or set(ack) - required - {"reason"}:
             return False
         if type(ack["revision"]) is not int or not 0 <= ack["revision"] <= 0xffffffff:
             return False
@@ -328,7 +328,7 @@ def make_local_mqtt_client(settings, cloud_client):
     client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
                          client_id=settings.local_mqtt_client_id, protocol=mqtt.MQTTv5, manual_ack=True)
     client._transport_verified=False
-    subscriptions=set()
+    subscriptions={}
     policy = TelemetryPolicy(getattr(settings, "telemetry_coalescing_enabled", True),
                              getattr(settings, "telemetry_snapshot_seconds", 60))
     if settings.local_mqtt_username:
@@ -348,16 +348,17 @@ def make_local_mqtt_client(settings, cloud_client):
                 result,mid=_client.subscribe(pattern,options=mqtt.SubscribeOptions(qos=getattr(settings, "mqtt_uplink_qos", 1),retainAsPublished=True))
                 if result != mqtt.MQTT_ERR_SUCCESS:
                     INGRESS_FAILED.set();STOP.set();return
-                subscriptions.add(mid)
+                subscriptions[mid] = getattr(settings, "mqtt_uplink_qos", 1)
             print("[LOCAL MQTT] connected; verifying retained-delivery subscriptions")
         else:
             print(f"[LOCAL MQTT] broker connection failed rc={rc}")
 
     def on_subscribe(_client,_userdata,mid,reason_codes,_properties=None):
-        if any(getattr(code,"is_failure",False) for code in reason_codes):
+        expected = subscriptions.get(mid)
+        if expected is None or len(reason_codes) != 1 or getattr(reason_codes[0], "is_failure", False) or getattr(reason_codes[0], "value", None) != expected:
             _client._transport_verified=False
             INGRESS_FAILED.set();STOP.set();return
-        subscriptions.discard(mid)
+        subscriptions.pop(mid)
         _client._transport_verified=not subscriptions
 
     def on_disconnect(_client,*_args):
@@ -367,7 +368,7 @@ def make_local_mqtt_client(settings, cloud_client):
     def on_message(_client, _userdata, msg):
         try:
             if msg.topic.endswith("/control-ack"):
-                if not forward_local_control_ack(settings, cloud_client, msg):
+                if not forward_local_control_ack(settings, cloud_client, msg, transport_verified=_client._transport_verified):
                     print("[LOCAL MQTT] rejected invalid WROVER control acknowledgement")
             else:
                 forward_local_message(settings, cloud_client, msg, policy,transport_verified=_client._transport_verified)

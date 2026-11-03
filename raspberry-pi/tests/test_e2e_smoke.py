@@ -331,10 +331,11 @@ class GatewaySmokeTests(unittest.TestCase):
         client = FakeMqttClient()
         def message(value, retained=False):
             return types.SimpleNamespace(topic="factory/site/line/wrover/control-ack", payload=json.dumps(value).encode(), retain=retained)
-        self.assertTrue(sensor_gateway.forward_local_control_ack(settings, client, message(ack)))
-        self.assertFalse(sensor_gateway.forward_local_control_ack(settings, client, message(ack, True)))
+        self.assertTrue(sensor_gateway.forward_local_control_ack(settings, client, message(ack), transport_verified=True))
+        self.assertFalse(sensor_gateway.forward_local_control_ack(settings, client, message(ack), transport_verified=False))
+        self.assertFalse(sensor_gateway.forward_local_control_ack(settings, client, message(ack, True), transport_verified=True))
         for field, invalid in (("revision", True), ("uplinkQos", 3), ("deviceId", "other")):
-            self.assertFalse(sensor_gateway.forward_local_control_ack(settings, client, message({**ack, field: invalid})))
+            self.assertFalse(sensor_gateway.forward_local_control_ack(settings, client, message({**ack, field: invalid}), transport_verified=True))
         self.assertEqual(len(client.published), 1)
 
     def test_wrover_relay_uses_configured_downlink_qos(self):
@@ -518,9 +519,9 @@ class GatewaySmokeTests(unittest.TestCase):
         local.on_connect(local, None, None, 0)
         self.assertEqual(local.subscribed, ["factory/factory-a/line-1/+/telemetry", "factory/factory-a/line-1/+/heartbeat"])
         self.assertFalse(local._transport_verified)
-        local.on_subscribe(local,None,1,[])
+        local.on_subscribe(local,None,1,[types.SimpleNamespace(value=1, is_failure=False)])
         self.assertFalse(local._transport_verified)
-        local.on_subscribe(local,None,2,[])
+        local.on_subscribe(local,None,2,[types.SimpleNamespace(value=1, is_failure=False)])
         self.assertTrue(local._transport_verified)
         local.on_disconnect(local)
         self.assertFalse(local._transport_verified)
