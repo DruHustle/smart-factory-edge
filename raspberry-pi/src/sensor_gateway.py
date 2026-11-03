@@ -188,7 +188,7 @@ def forward_local_message(settings, cloud_client, msg, policy=None, transport_ve
         policy.accepted(msg.topic, payload, payload_bytes, forwarded=False)
         policy.report_if_due()
         return True
-    result = cloud_client.publish(encoded_topic(settings.site_id,settings.line_id,payload["deviceId"],msg.topic.split("/")[-1]), forwarded_payload, qos=1, retain=False)
+    result = cloud_client.publish(encoded_topic(settings.site_id,settings.line_id,payload["deviceId"],msg.topic.split("/")[-1]), forwarded_payload, qos=getattr(settings, "mqtt_uplink_qos", 1), retain=False)
     if getattr(result, "rc", 0) != getattr(mqtt, "MQTT_ERR_SUCCESS", 0):
         print(f"[LOCAL MQTT] upstream queue rejected message on {msg.topic}")
         raise LocalDeliveryError("Durable queue rejected local telemetry")
@@ -243,7 +243,7 @@ def relay_gpio_command(settings, local_client, command: dict) -> dict:
     local_command = validate_gpio_command(settings, command)
     target = command["targetDeviceId"]
     topic = command_topic(settings.site_id, settings.line_id, target)
-    result = local_client.publish(topic, json.dumps(local_command), qos=1, retain=False)
+    result = local_client.publish(topic, json.dumps(local_command), qos=getattr(settings, "mqtt_downlink_qos", 1), retain=False)
     if getattr(result, "rc", 0) != getattr(mqtt, "MQTT_ERR_SUCCESS", 0):
         raise RuntimeError("Pi-local MQTT broker rejected the GPIO command")
     return {"commandId": command["commandId"], "targetDeviceId": target, "status": "queued"}
@@ -310,7 +310,7 @@ def make_local_mqtt_client(settings, cloud_client):
                 patterns.extend((f"factory/{site}/{line}/+/telemetry",f"factory/{site}/{line}/+/heartbeat"))
             patterns.extend(encoded_topic(settings.site_id,settings.line_id,d,"control-ack") for d in getattr(settings,"local_mqtt_control_device_ids",()))
             for pattern in patterns:
-                result,mid=_client.subscribe(pattern,options=mqtt.SubscribeOptions(qos=1,retainAsPublished=True))
+                result,mid=_client.subscribe(pattern,options=mqtt.SubscribeOptions(qos=getattr(settings, "mqtt_uplink_qos", 1),retainAsPublished=True))
                 if result != mqtt.MQTT_ERR_SUCCESS:
                     INGRESS_FAILED.set();STOP.set();return
                 subscriptions.add(mid)
@@ -379,7 +379,7 @@ def make_mqtt_client(settings, apply_configuration=None, relay_control=None, rel
     def on_connect(_client, _userdata, _flags, rc, _properties=None):
         if rc == 0:
             print("[MQTT] connected")
-            _client.subscribe(expected_topic, qos=1)
+            _client.subscribe(expected_topic, qos=getattr(settings, "mqtt_downlink_qos", 1))
             _client.subscribe(connectivity_topic, qos=1)
         else:
             print(f"[MQTT] connect failed rc={rc}")
@@ -585,7 +585,7 @@ def heartbeat_loop(settings, client):
         }
         # Current liveness is ephemeral: do not spool old heartbeats for replay.
         if client.is_connected():
-            client.publish(heartbeat_topic(settings.site_id, settings.line_id, settings.device_id), json.dumps(payload, separators=(",", ":")), qos=1)
+            client.publish(heartbeat_topic(settings.site_id, settings.line_id, settings.device_id), json.dumps(payload, separators=(",", ":")), qos=getattr(settings, "mqtt_uplink_qos", 1))
         STOP.wait(getattr(settings, "heartbeat_interval_seconds", 60))
 
 
@@ -693,7 +693,7 @@ def main():
         if isinstance(data.get("connectivity"), dict):
             payload["connectivity"] = data["connectivity"]
         topic = telemetry_topic(settings.site_id, settings.line_id, settings.device_id)
-        result = publisher.publish(topic, json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False), qos=1)
+        result = publisher.publish(topic, json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False), qos=getattr(settings, "mqtt_uplink_qos", 1))
         if getattr(result, "rc", 0) != 0:
             if "connectivity" in payload:
                 raise RuntimeError("connectivity_delivery_unavailable")

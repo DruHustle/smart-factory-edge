@@ -37,6 +37,19 @@ class GatewayConfigurationTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "between 1 and 60"):
                         load_settings()
 
+    def test_mqtt_qos_defaults_and_validation(self):
+        _purge_modules("config")
+        from config import load_settings
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual((load_settings().mqtt_uplink_qos, load_settings().mqtt_downlink_qos), (1, 1))
+        for qos in ("0", "1", "2"):
+            with patch.dict("os.environ", {"MQTT_UPLINK_QOS": qos, "MQTT_DOWNLINK_QOS": qos}, clear=True):
+                self.assertEqual((load_settings().mqtt_uplink_qos, load_settings().mqtt_downlink_qos), (int(qos), int(qos)))
+        for name in ("MQTT_UPLINK_QOS", "MQTT_DOWNLINK_QOS"):
+            for qos in ("3", "-1", " 1", "true", ""):
+                with patch.dict("os.environ", {name: qos}, clear=True), self.assertRaisesRegex(RuntimeError, name):
+                    load_settings()
+
     def test_asset_polling_defaults_to_subsecond_for_motion_telemetry(self):
         _purge_modules("config")
         with patch.dict("os.environ", {"EDGE_ENV": "development"}, clear=True):
@@ -275,6 +288,18 @@ class GatewaySmokeTests(unittest.TestCase):
         client.on_message(client, None, types.SimpleNamespace(topic=topic, payload=json.dumps(command).encode(), retain=False))
         self.assertEqual(relayed, [command])
         self.assertEqual(json.loads(client.published[-1][1])["status"], "serial_write_accepted")
+
+    def test_wrover_relay_uses_configured_downlink_qos(self):
+        sensor_gateway = importlib.import_module("sensor_gateway")
+        command = {"schemaVersion": 1, "action": "set_gpio", "commandId": "qos-test-0001",
+                   "targetDeviceId": "wrover", "pin": 18, "value": 1, "holdMs": 250,
+                   "expiresAt": int(sensor_gateway.time.time() * 1000) + 5000}
+        for qos in (0, 1, 2):
+            settings = types.SimpleNamespace(site_id="site", line_id="line", local_mqtt_device_ids=("wrover",),
+                local_mqtt_control_device_ids=("wrover",), mqtt_downlink_qos=qos)
+            client = FakeMqttClient()
+            sensor_gateway.relay_gpio_command(settings, client, command)
+            self.assertEqual(client.published[0][2:], (qos, False))
 
     def test_gateway_relays_only_valid_short_lived_wrover_gpio_commands(self):
         sensor_gateway = importlib.import_module("sensor_gateway")
