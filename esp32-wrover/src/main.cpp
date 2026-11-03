@@ -579,7 +579,11 @@ void publishTelemetry() {
   }
 
   if (publishQos(topicTelemetry(), out, size, qosConfiguration.uplink)) {
-    Serial.printf("[PUB] QoS 1 telemetry acknowledged by Pi broker: %s\n", out);
+    if (qosConfiguration.uplink == 0) {
+      Serial.printf("[PUB] QoS 0 telemetry sent; delivery unconfirmed: %s\n", out);
+    } else {
+      Serial.printf("[PUB] QoS %u telemetry acknowledged by Pi broker: %s\n", qosConfiguration.uplink, out);
+    }
   }
 
   JsonDocument hb;
