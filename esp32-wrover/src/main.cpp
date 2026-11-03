@@ -6,6 +6,8 @@
 #include <ArduinoJson.h>
 #include <DHT.h>
 #include <Preferences.h>
+#include <esp_timer.h>
+#include <freertos/semphr.h>
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
@@ -99,6 +101,12 @@ MqttClient mqttClient(plainWifiClient);
 DHT dht11Sensor(DHT11_DATA_PIN, DHT11);
 Preferences buttonPreferences;
 bool buttonPreferencesReady = false;
+Preferences qosPreferences;
+bool qosPreferencesReady = false;
+struct QosConfiguration { uint32_t revision; uint8_t uplink; uint8_t downlink; };
+QosConfiguration qosConfiguration = {0, 1, 1};
+struct PendingQos { bool pending; QosConfiguration value; String commandId; uint64_t expiresAt; };
+PendingQos pendingQos = {false, {0, 1, 1}, "", 0};
 
 unsigned long lastPublishMs = 0;
 const unsigned long publishIntervalMs = 5000;
@@ -126,15 +134,31 @@ struct ControlOutput {
   uint8_t pin;
   bool leased;
   unsigned long resetAtMs;
+  int64_t resetAtUs;
+  esp_timer_handle_t timer;
 };
 
 ControlOutput controlOutputs[] = {
-  {CONTROL_GPIO_PIN_1, false, 0},
+  {CONTROL_GPIO_PIN_1, false, 0, 0, nullptr},
 };
+SemaphoreHandle_t controlOutputMutex = nullptr;
+
+// Runs independently of MQTT's synchronous network operations. A stale timer
+// callback cannot cancel a newer pulse because it checks the current deadline.
+void controlOutputTimerCallback(void* argument) {
+  ControlOutput* output = static_cast<ControlOutput*>(argument);
+  if (!controlOutputMutex || xSemaphoreTake(controlOutputMutex, portMAX_DELAY) != pdTRUE) return;
+  if (output->leased && esp_timer_get_time() >= output->resetAtUs) {
+    digitalWrite(output->pin, CONTROL_GPIO_SAFE_LEVEL);
+    output->leased = false;
+  }
+  xSemaphoreGive(controlOutputMutex);
+}
 
 String recentCommandIds[16];
 uint8_t nextRecentCommandId = 0;
 
+bool publishQos(const String& topic, const char* payload, size_t payloadSize, uint8_t qos);
 bool publishQos1(const String& topic, const char* payload, size_t payloadSize);
 
 // mqtt-topic-v1: dots are encoded for RabbitMQ; JSON identity remains canonical.
@@ -157,10 +181,19 @@ uint64_t currentEpochMilliseconds() {
 }
 
 void configureControlOutputs() {
+  controlOutputMutex = xSemaphoreCreateMutex();
   for (ControlOutput& output : controlOutputs) {
     // Preload the output latch before enabling output mode to reduce startup glitches.
     digitalWrite(output.pin, CONTROL_GPIO_SAFE_LEVEL);
     pinMode(output.pin, OUTPUT);
+    esp_timer_create_args_t args = {};
+    args.callback = &controlOutputTimerCallback;
+    args.arg = &output;
+    args.name = "gpio-safe";
+    if (!controlOutputMutex || esp_timer_create(&args, &output.timer) != ESP_OK) {
+      output.timer = nullptr;
+      Serial.printf("[GPIO] GPIO%u control disabled: safety timer unavailable\n", output.pin);
+    }
   }
   digitalWrite(BUTTON_LED_PIN, LOW);
   pinMode(BUTTON_LED_PIN, OUTPUT);
@@ -191,13 +224,17 @@ void pollUserButton() {
 }
 
 void setAllControlOutputsSafe() {
+  if (!controlOutputMutex || xSemaphoreTake(controlOutputMutex, portMAX_DELAY) != pdTRUE) return;
   for (ControlOutput& output : controlOutputs) {
     digitalWrite(output.pin, CONTROL_GPIO_SAFE_LEVEL);
     output.leased = false;
+    if (output.timer) esp_timer_stop(output.timer);
   }
+  xSemaphoreGive(controlOutputMutex);
 }
 
 void resetExpiredControlOutputs() {
+  if (!controlOutputMutex || xSemaphoreTake(controlOutputMutex, portMAX_DELAY) != pdTRUE) return;
   const unsigned long now = millis();
   for (ControlOutput& output : controlOutputs) {
     if (output.leased && static_cast<long>(now - output.resetAtMs) >= 0) {
@@ -206,6 +243,7 @@ void resetExpiredControlOutputs() {
       Serial.printf("[GPIO] GPIO%u returned to configured safe level\n", output.pin);
     }
   }
+  xSemaphoreGive(controlOutputMutex);
 }
 
 bool isConfiguredControlPin(int pin) {
@@ -250,8 +288,85 @@ void publishControlAck(const String& commandId, const char* status, int pin = -1
   if (size > 0 && size < sizeof(payload)) publishQos1(topicControlAck(), payload, size);
 }
 
+void publishQosAck(const String& commandId, const char* status, uint32_t requestedRevision, const char* reason = nullptr) {
+  JsonDocument ack;
+  ack["action"] = "configure_mqtt_qos";
+  ack["deviceId"] = DEVICE_ID;
+  ack["commandId"] = commandId;
+  ack["status"] = status;
+  ack["timestamp"] = currentEpochMilliseconds();
+  ack["revision"] = qosConfiguration.revision;
+  ack["requestedRevision"] = requestedRevision;
+  ack["uplinkQos"] = qosConfiguration.uplink;
+  ack["downlinkQos"] = qosConfiguration.downlink;
+  if (reason) ack["reason"] = reason;
+  char payload[320];
+  const size_t size = serializeJson(ack, payload, sizeof(payload));
+  if (size > 0 && size < sizeof(payload)) publishQos1(topicControlAck(), payload, size);
+}
+
+void queueQosConfiguration(JsonObjectConst command, bool retained) {
+  const char* rawId = command["commandId"];
+  const String id = rawId ? String(rawId) : String();
+  const uint32_t requestedRevision = command["revision"].is<uint32_t>() ? command["revision"].as<uint32_t>() : 0;
+  if (retained || command.size() != 7 || !validCommandId(id) ||
+      !command["schemaVersion"].is<int>() || command["schemaVersion"].as<int>() != 1 ||
+      !command["revision"].is<uint32_t>() || !command["uplinkQos"].is<int>() ||
+      !command["downlinkQos"].is<int>() || !command["expiresAt"].is<uint64_t>() || !clockReady) {
+    publishQosAck(id.length() ? id : "invalid", "rejected", requestedRevision, "invalid_fields");
+    return;
+  }
+  const uint32_t revision = command["revision"].as<uint32_t>();
+  const int uplink = command["uplinkQos"].as<int>();
+  const int downlink = command["downlinkQos"].as<int>();
+  const uint64_t expiresAt = command["expiresAt"].as<uint64_t>();
+  const uint64_t now = currentEpochMilliseconds();
+  if (!qosPreferencesReady || pendingQos.pending || revision == 0 || revision < qosConfiguration.revision ||
+      uplink < 0 || uplink > 2 || downlink < 0 || downlink > 2 || expiresAt <= now || expiresAt > now + 30000ULL ||
+      (revision == qosConfiguration.revision && (uplink != qosConfiguration.uplink || downlink != qosConfiguration.downlink))) {
+    publishQosAck(id, "rejected", requestedRevision, "configuration_not_accepted");
+    return;
+  }
+  pendingQos = {true, {revision, static_cast<uint8_t>(uplink), static_cast<uint8_t>(downlink)}, id, expiresAt};
+}
+
+// Resubscription and NVS writes run outside the MQTT callback. A broker grant
+// and durable storage are both required before reporting the revision applied.
+void applyPendingQos() {
+  if (!pendingQos.pending) return;
+  const PendingQos request = pendingQos;
+  pendingQos.pending = false;
+  if (!mqttClient.connected() || !clockReady || currentEpochMilliseconds() >= request.expiresAt) {
+    if (mqttClient.connected()) publishQosAck(request.commandId, "rejected", request.value.revision, "expired");
+    return;
+  }
+  const QosConfiguration previous = qosConfiguration;
+  if (request.value.revision < previous.revision ||
+      (request.value.revision == previous.revision &&
+       (request.value.uplink != previous.uplink || request.value.downlink != previous.downlink))) {
+    publishQosAck(request.commandId, "rejected", request.value.revision, "stale_revision");
+    return;
+  }
+  if (!mqttClient.subscribe(topicCommands(), request.value.downlink) || mqttClient.subscribeQoS() != request.value.downlink) {
+    mqttClient.stop();
+    return;
+  }
+  if (currentEpochMilliseconds() >= request.expiresAt) {
+    mqttClient.stop();
+    return;
+  }
+  if (request.value.revision != previous.revision &&
+      qosPreferences.putBytes("policy", &request.value, sizeof(request.value)) != sizeof(request.value)) {
+    mqttClient.stop();
+    return;
+  }
+  qosConfiguration = request.value;
+  publishQosAck(request.commandId, "applied", request.value.revision);
+}
+
 void handleMqttMessage(int messageSize) {
   const String receivedTopic = mqttClient.messageTopic();
+  const bool retained = mqttClient.messageRetain() != 0;
   String payload;
   if (messageSize > 0 && messageSize <= 512) payload.reserve(messageSize);
   while (mqttClient.available()) {
@@ -276,6 +391,10 @@ void handleMqttMessage(int messageSize) {
   }
 
   const char* action = command["action"];
+  if (action && String(action) == "configure_mqtt_qos") {
+    queueQosConfiguration(command.as<JsonObjectConst>(), retained);
+    return;
+  }
   const char* rawCommandId = command["commandId"];
   const String commandId = rawCommandId ? String(rawCommandId) : String();
   if (!action || String(action) != "set_gpio" || !validCommandId(commandId) ||
@@ -306,13 +425,35 @@ void handleMqttMessage(int messageSize) {
     return;
   }
 
+  bool outputApplied = false;
   for (ControlOutput& output : controlOutputs) {
     if (output.pin == pin) {
-      digitalWrite(output.pin, value);
-      output.leased = value != CONTROL_GPIO_SAFE_LEVEL;
-      output.resetAtMs = millis() + min(holdMs, static_cast<unsigned int>(expiresAt - nowEpochMs));
+      if (!controlOutputMutex || !output.timer || xSemaphoreTake(controlOutputMutex, portMAX_DELAY) != pdTRUE) break;
+      esp_timer_stop(output.timer);
+      digitalWrite(output.pin, CONTROL_GPIO_SAFE_LEVEL);
+      output.leased = false;
+      if (value == CONTROL_GPIO_SAFE_LEVEL) {
+        outputApplied = true;
+      } else {
+        const unsigned int durationMs = min(holdMs, static_cast<unsigned int>(expiresAt - nowEpochMs));
+        output.resetAtMs = millis() + durationMs;
+        output.resetAtUs = esp_timer_get_time() + static_cast<int64_t>(durationMs) * 1000;
+        digitalWrite(output.pin, value);
+        output.leased = true;
+        if (esp_timer_start_once(output.timer, static_cast<uint64_t>(durationMs) * 1000) == ESP_OK) {
+          outputApplied = true;
+        } else {
+          digitalWrite(output.pin, CONTROL_GPIO_SAFE_LEVEL);
+          output.leased = false;
+        }
+      }
+      xSemaphoreGive(controlOutputMutex);
       break;
     }
+  }
+  if (!outputApplied) {
+    publishControlAck(commandId, "rejected", pin, value, "safety_timer_unavailable");
+    return;
   }
   publishControlAck(commandId, "applied", pin, value);
   Serial.printf("[GPIO] GPIO%d set to %d for at most %u ms\n", pin, value, holdMs);
@@ -357,7 +498,7 @@ void connectMqtt() {
     Serial.printf("[MQTT] Connecting to Pi gateway %s:%d ...\n", MQTT_HOST, MQTT_PORT);
     if (mqttClient.connect(MQTT_HOST, MQTT_PORT)) {
       Serial.println("[MQTT] Connected to Pi gateway");
-      if (!mqttClient.subscribe(topicCommands(), 1)) {
+      if (!mqttClient.subscribe(topicCommands(), qosConfiguration.downlink)) {
         Serial.println("[MQTT] Command subscription failed; GPIO commands are unavailable");
       }
     } else {
@@ -368,16 +509,20 @@ void connectMqtt() {
 }
 
 bool publishQos1(const String& topic, const char* payload, size_t payloadSize) {
+  return publishQos(topic, payload, payloadSize, 1);
+}
+
+bool publishQos(const String& topic, const char* payload, size_t payloadSize, uint8_t qos) {
   if (!mqttClient.connected()) return false;
-  if (!mqttClient.beginMessage(topic, payloadSize, false, 1, false)) {
-    Serial.printf("[MQTT] Could not start QoS 1 publish to %s\n", topic.c_str());
+  if (!mqttClient.beginMessage(topic, payloadSize, false, qos, false)) {
+    Serial.printf("[MQTT] Could not start QoS %u publish to %s\n", qos, topic.c_str());
     return false;
   }
 
   const size_t written = mqttClient.write(reinterpret_cast<const uint8_t*>(payload), payloadSize);
   const int acknowledged = mqttClient.endMessage();
   if (written != payloadSize || acknowledged != 1) {
-    Serial.printf("[MQTT] QoS 1 publish was not acknowledged for %s\n", topic.c_str());
+    Serial.printf("[MQTT] QoS %u publish did not complete for %s\n", qos, topic.c_str());
     return false;
   }
   return true;
@@ -433,7 +578,7 @@ void publishTelemetry() {
     return;
   }
 
-  if (publishQos1(topicTelemetry(), out, size)) {
+  if (publishQos(topicTelemetry(), out, size, qosConfiguration.uplink)) {
     Serial.printf("[PUB] QoS 1 telemetry acknowledged by Pi broker: %s\n", out);
   }
 
@@ -444,7 +589,7 @@ void publishTelemetry() {
   char hbOut[128];
   const size_t heartbeatSize = serializeJson(hb, hbOut, sizeof(hbOut));
   if (heartbeatSize > 0 && heartbeatSize < sizeof(hbOut)) {
-    publishQos1(topicHeartbeat(), hbOut, heartbeatSize);
+    publishQos(topicHeartbeat(), hbOut, heartbeatSize, qosConfiguration.uplink);
   }
 }
 
@@ -466,6 +611,11 @@ void setup() {
     Serial.printf("[BUTTON] Restored lifetime press count=%lu\n", static_cast<unsigned long>(buttonPressCount));
   } else {
     Serial.println("[BUTTON] Could not open nonvolatile counter storage");
+  }
+  qosPreferencesReady = qosPreferences.begin("sf-mqtt-qos", false);
+  if (qosPreferencesReady && qosPreferences.getBytesLength("policy") == sizeof(qosConfiguration)) {
+    QosConfiguration stored;
+    if (qosPreferences.getBytes("policy", &stored, sizeof(stored)) == sizeof(stored) && stored.uplink <= 2 && stored.downlink <= 2) qosConfiguration = stored;
   }
   mqttClient.onMessage(handleMqttMessage);
 
@@ -507,6 +657,7 @@ void loop() {
   }
 
   mqttClient.poll();
+  applyPendingQos();
   pollUserButton();
   if (buttonTelemetryPending) {
     buttonTelemetryPending = false;

@@ -8,6 +8,66 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from durable_state import DurableState, DurablePublisher
 
 class DurableStateTests(unittest.TestCase):
+    def test_gateway_qos_policy_is_durable_and_rejects_stale_revisions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.sqlite3")
+            state = DurableState(path)
+            self.assertIsNone(state.qos_policy())
+            state.save_qos_policy(3, 2, 0)
+            state.close()
+            state = DurableState(path)
+            self.assertEqual(state.qos_policy(), (3, 2, 0))
+            state.save_qos_policy(3, 2, 0)
+            for values in ((2, 1, 1), (3, 1, 1), (4, 3, 1), (4, True, 1)):
+                with self.assertRaises(ValueError): state.save_qos_policy(*values)
+            self.assertEqual(state.qos_policy(), (3, 2, 0))
+            state.close()
+
+    def test_qos_is_recorded_per_message_and_survives_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.sqlite3")
+            state = DurableState(path)
+            for qos in (0, 1, 2):
+                state.enqueue("test/telemetry", f"sample-{qos}", qos=qos)
+            state.close()
+            state = DurableState(path)
+            sent = []
+            client = SimpleNamespace(is_connected=lambda: True, publish=lambda topic, payload, **opts:
+                sent.append((payload, opts["qos"])) or SimpleNamespace(rc=0, wait_for_publish=lambda **_:None, is_published=lambda:True))
+            publisher = DurablePublisher(client, state)
+            self.assertTrue(all(publisher.drain_one() for _ in range(3)))
+            self.assertEqual(sent, [("sample-0", 0), ("sample-1", 1), ("sample-2", 2)])
+            self.assertEqual(state._db.execute("SELECT count(*) FROM telemetry_qos").fetchone()[0], 0)
+            state.close()
+
+    def test_legacy_queue_rows_default_to_qos_one_and_reject_invalid_levels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = DurableState(str(Path(directory) / "state.sqlite3"))
+            state._db.execute("INSERT INTO telemetry VALUES (?, ?, ?, ?)", ("legacy", "test", "old", 0))
+            state._db.commit()
+            self.assertEqual(state.first_with_qos(), ("legacy", "test", "old", 1))
+            for qos in (-1, 3, True, "1"):
+                with self.assertRaises(ValueError):
+                    state.enqueue("test", "value", qos=qos)
+            state.close()
+
+    def test_rollback_reinserting_same_payload_does_not_reuse_stale_qos(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.sqlite3")
+            state = DurableState(path)
+            identity = state.enqueue("test", "payload", qos=2)
+            queued_at = state._db.execute("SELECT queued_at FROM telemetry WHERE id=?", (identity,)).fetchone()[0]
+            # Simulate the previous release deleting and re-enqueuing without
+            # touching the new metadata table.
+            state._db.execute("DELETE FROM telemetry WHERE id=?", (identity,))
+            state._db.execute("INSERT INTO telemetry VALUES (?, ?, ?, ?)", (identity, "test", "payload", queued_at + 1))
+            state._db.commit()
+            state.close()
+            state = DurableState(path)
+            self.assertEqual(state.first_with_qos(), (identity, "test", "payload", 1))
+            self.assertEqual(state._db.execute("SELECT count(*) FROM telemetry_qos").fetchone()[0], 0)
+            state.close()
+
     def test_old_dotted_topics_reopen_and_publish_without_renaming_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             path=str(Path(directory)/"state.sqlite3")

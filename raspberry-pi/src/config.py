@@ -8,6 +8,13 @@ def _as_bool(value: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _mqtt_qos(name: str) -> int:
+    value = os.getenv(name, "1")
+    if value not in ("0", "1", "2"):
+        raise RuntimeError(f"{name} must be 0, 1, or 2")
+    return int(value)
+
+
 @dataclass
 class Settings:
     device_id: str
@@ -53,6 +60,8 @@ class Settings:
     telemetry_coalescing_enabled: bool = True
     telemetry_snapshot_seconds: int = 60
     heartbeat_interval_seconds: int = 60
+    mqtt_uplink_qos: int = 1
+    mqtt_downlink_qos: int = 1
 
 
 def load_settings() -> Settings:
@@ -96,6 +105,8 @@ def load_settings() -> Settings:
         telemetry_coalescing_enabled=_as_bool(os.getenv("TELEMETRY_COALESCING_ENABLED"), True),
         telemetry_snapshot_seconds=int(os.getenv("TELEMETRY_SNAPSHOT_SECONDS", "60")),
         heartbeat_interval_seconds=int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "60")),
+        mqtt_uplink_qos=_mqtt_qos("MQTT_UPLINK_QOS"),
+        mqtt_downlink_qos=_mqtt_qos("MQTT_DOWNLINK_QOS"),
         # Generic line-delimited serial ingest is opt-in. AAS serial profiles
         # have their own exclusive owner and must never race a default tty path.
         serial_enabled=_as_bool(os.getenv("SERIAL_ENABLED"), False),

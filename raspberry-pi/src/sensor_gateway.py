@@ -188,7 +188,7 @@ def forward_local_message(settings, cloud_client, msg, policy=None, transport_ve
         policy.accepted(msg.topic, payload, payload_bytes, forwarded=False)
         policy.report_if_due()
         return True
-    result = cloud_client.publish(encoded_topic(settings.site_id,settings.line_id,payload["deviceId"],msg.topic.split("/")[-1]), forwarded_payload, qos=1, retain=False)
+    result = cloud_client.publish(encoded_topic(settings.site_id,settings.line_id,payload["deviceId"],msg.topic.split("/")[-1]), forwarded_payload, qos=getattr(settings, "mqtt_uplink_qos", 1), retain=False)
     if getattr(result, "rc", 0) != getattr(mqtt, "MQTT_ERR_SUCCESS", 0):
         print(f"[LOCAL MQTT] upstream queue rejected message on {msg.topic}")
         raise LocalDeliveryError("Durable queue rejected local telemetry")
@@ -243,13 +243,70 @@ def relay_gpio_command(settings, local_client, command: dict) -> dict:
     local_command = validate_gpio_command(settings, command)
     target = command["targetDeviceId"]
     topic = command_topic(settings.site_id, settings.line_id, target)
-    result = local_client.publish(topic, json.dumps(local_command), qos=1, retain=False)
+    result = local_client.publish(topic, json.dumps(local_command), qos=getattr(settings, "mqtt_downlink_qos", 1), retain=False)
     if getattr(result, "rc", 0) != getattr(mqtt, "MQTT_ERR_SUCCESS", 0):
         raise RuntimeError("Pi-local MQTT broker rejected the GPIO command")
     return {"commandId": command["commandId"], "targetDeviceId": target, "status": "queued"}
 
 
-def forward_local_control_ack(settings, cloud_client, msg) -> bool:
+def validate_qos_configuration(settings, command: dict) -> tuple[str, dict]:
+    """Validate a bounded settings request for an allowlisted WROVER."""
+    required = {"schemaVersion", "action", "commandId", "targetDeviceId", "revision", "uplinkQos", "downlinkQos", "expiresAt"}
+    if not isinstance(command, dict) or set(command) != required or type(command.get("schemaVersion")) is not int or command.get("schemaVersion") != 1 or command.get("action") != "configure_mqtt_qos":
+        raise ValueError("MQTT QoS configuration fields are invalid")
+    target, identity = command.get("targetDeviceId"), command.get("commandId")
+    if target not in set(getattr(settings, "local_mqtt_control_device_ids", ())) or target not in set(settings.local_mqtt_device_ids):
+        raise ValueError("Target WROVER is not enabled for control")
+    if not isinstance(identity, str) or not 8 <= len(identity) <= 64 or not all((c.isascii() and c.isalnum()) or c in "-_." for c in identity):
+        raise ValueError("QoS command ID is invalid")
+    for field in ("uplinkQos", "downlinkQos"):
+        if type(command[field]) is not int or command[field] not in (0, 1, 2):
+            raise ValueError("MQTT QoS must be 0, 1, or 2")
+    if type(command["revision"]) is not int or not 1 <= command["revision"] <= 0xffffffff:
+        raise ValueError("MQTT QoS revision is invalid")
+    now = int(time.time() * 1000)
+    if type(command["expiresAt"]) is not int or not now < command["expiresAt"] <= now + 30000:
+        raise ValueError("MQTT QoS command has expired or has an invalid expiry")
+    local_command = {key: value for key, value in command.items() if key != "targetDeviceId"}
+    return target, local_command
+
+
+def relay_qos_configuration(settings, local_client, command: dict) -> dict:
+    """Send the validated request without retaining a physical-device command."""
+    target, local_command = validate_qos_configuration(settings, command)
+    identity = command["commandId"]
+    result = local_client.publish(command_topic(settings.site_id, settings.line_id, target), json.dumps(local_command), qos=1, retain=False)
+    if getattr(result, "rc", 0) != getattr(mqtt, "MQTT_ERR_SUCCESS", 0):
+        raise RuntimeError("Pi-local MQTT broker rejected the QoS request")
+    return {"commandId": identity, "targetDeviceId": target, "status": "queued"}
+
+
+def apply_gateway_qos(settings, state, client, local_client, command):
+    validate_qos_configuration(settings, command)
+    if state is None or local_client is None:
+        raise RuntimeError("QoS configuration requires durable storage and the local broker")
+    previous = state.qos_policy()
+    revision, uplink, downlink = command["revision"], command["uplinkQos"], command["downlinkQos"]
+    if previous and (revision < previous[0] or (revision == previous[0] and previous[1:] != (uplink, downlink))):
+        raise ValueError("MQTT QoS revision is stale or conflicts")
+    if not local_client._update_uplink_qos(uplink):
+        INGRESS_FAILED.set(); STOP.set()
+        raise RuntimeError("Local broker did not grant the requested uplink QoS")
+    # Any subsequent failure restarts from the last persisted policy instead
+    # of leaving subscriptions and settings silently out of sync.
+    try:
+        if not client._update_downlink_qos(downlink):
+            raise RuntimeError("Cloud broker rejected the downlink QoS subscription")
+        validate_qos_configuration(settings, command)
+        state.save_qos_policy(revision, uplink, downlink)
+        settings.mqtt_uplink_qos, settings.mqtt_downlink_qos = uplink, downlink
+        return relay_qos_configuration(settings, local_client, command)
+    except Exception:
+        INGRESS_FAILED.set(); STOP.set()
+        raise
+
+
+def forward_local_control_ack(settings, cloud_client, msg, transport_verified=False) -> bool:
     """Forward a WROVER acknowledgement to the gateway's scoped cloud ack topic."""
     parts = msg.topic.split("/")
     if len(parts)!=5 or parts[0]!="factory" or parts[4]!="control-ack":return False
@@ -274,6 +331,18 @@ def forward_local_control_ack(settings, cloud_client, msg) -> bool:
         return False
     if ack.get("status") not in {"applied", "rejected", "duplicate_ignored"}:
         return False
+    if ack.get("action") == "configure_mqtt_qos":
+        required = {"action", "deviceId", "commandId", "status", "timestamp", "revision", "requestedRevision", "uplinkQos", "downlinkQos"}
+        if not transport_verified or getattr(msg, "retain", False) or not required.issubset(ack) or set(ack) - required - {"reason"}:
+            return False
+        if type(ack["requestedRevision"]) is not int or not 1 <= ack["requestedRevision"] <= 0xffffffff:
+            return False
+        if type(ack["revision"]) is not int or not 0 <= ack["revision"] <= 0xffffffff:
+            return False
+        if any(type(ack[key]) is not int or ack[key] not in (0, 1, 2) for key in ("uplinkQos", "downlinkQos")):
+            return False
+        if ack["status"] not in {"applied", "rejected"} or ("reason" in ack and (not isinstance(ack["reason"], str) or len(ack["reason"]) > 128)):
+            return False
     pin = ack.get("pin")
     if pin is not None and (isinstance(pin, bool) or not isinstance(pin, int) or pin not in WROVER_CONTROL_PINS):
         return False
@@ -293,7 +362,9 @@ def make_local_mqtt_client(settings, cloud_client):
     client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
                          client_id=settings.local_mqtt_client_id, protocol=mqtt.MQTTv5, manual_ack=True)
     client._transport_verified=False
-    subscriptions=set()
+    subscriptions={}
+    subscription_lock = Lock()
+    subscriptions_done = Event()
     policy = TelemetryPolicy(getattr(settings, "telemetry_coalescing_enabled", True),
                              getattr(settings, "telemetry_snapshot_seconds", 60))
     if settings.local_mqtt_username:
@@ -301,38 +372,56 @@ def make_local_mqtt_client(settings, cloud_client):
     if settings.local_mqtt_use_tls:
         client.tls_set(ca_certs=settings.local_mqtt_ca_cert or None)
 
-    def on_connect(_client, _userdata, _flags, rc, _properties=None):
-        _client._transport_verified=False
-        subscriptions.clear()
-        if rc == 0:
-            patterns=[]
-            for site,line in sorted({(encode_level(settings.site_id),encode_level(settings.line_id)),(settings.site_id,settings.line_id)}):
-                patterns.extend((f"factory/{site}/{line}/+/telemetry",f"factory/{site}/{line}/+/heartbeat"))
-            patterns.extend(encoded_topic(settings.site_id,settings.line_id,d,"control-ack") for d in getattr(settings,"local_mqtt_control_device_ids",()))
-            for pattern in patterns:
-                result,mid=_client.subscribe(pattern,options=mqtt.SubscribeOptions(qos=1,retainAsPublished=True))
+    def start_subscriptions(_client, uplink):
+        patterns=[]
+        for site,line in sorted({(encode_level(settings.site_id),encode_level(settings.line_id)),(settings.site_id,settings.line_id)}):
+            patterns.extend(((f"factory/{site}/{line}/+/telemetry", uplink), (f"factory/{site}/{line}/+/heartbeat", uplink)))
+        patterns.extend((encoded_topic(settings.site_id,settings.line_id,d,"control-ack"), 1) for d in getattr(settings,"local_mqtt_control_device_ids",()))
+        with subscription_lock:
+            _client._transport_verified=False
+            subscriptions_done.clear()
+            subscriptions.clear()
+            for pattern, level in patterns:
+                result,mid=_client.subscribe(pattern,options=mqtt.SubscribeOptions(qos=level,retainAsPublished=True))
                 if result != mqtt.MQTT_ERR_SUCCESS:
-                    INGRESS_FAILED.set();STOP.set();return
-                subscriptions.add(mid)
-            print("[LOCAL MQTT] connected; verifying retained-delivery subscriptions")
+                    subscriptions_done.set(); INGRESS_FAILED.set(); STOP.set(); return False
+                subscriptions[mid] = level
+        return True
+
+    def on_connect(_client, _userdata, _flags, rc, _properties=None):
+        if rc == 0:
+            if start_subscriptions(_client, getattr(settings, "mqtt_uplink_qos", 1)):
+                print("[LOCAL MQTT] connected; verifying retained-delivery subscriptions")
         else:
+            _client._transport_verified=False
             print(f"[LOCAL MQTT] broker connection failed rc={rc}")
 
     def on_subscribe(_client,_userdata,mid,reason_codes,_properties=None):
-        if any(getattr(code,"is_failure",False) for code in reason_codes):
-            _client._transport_verified=False
-            INGRESS_FAILED.set();STOP.set();return
-        subscriptions.discard(mid)
-        _client._transport_verified=not subscriptions
+        with subscription_lock:
+            expected = subscriptions.get(mid)
+            if expected is None or len(reason_codes) != 1 or getattr(reason_codes[0], "is_failure", False) or getattr(reason_codes[0], "value", None) != expected:
+                _client._transport_verified=False
+                INGRESS_FAILED.set(); STOP.set(); subscriptions_done.set(); return
+            subscriptions.pop(mid)
+            _client._transport_verified=not subscriptions
+            if not subscriptions: subscriptions_done.set()
 
     def on_disconnect(_client,*_args):
-        _client._transport_verified=False
-        subscriptions.clear()
+        with subscription_lock:
+            _client._transport_verified=False
+            subscriptions.clear()
+            subscriptions_done.set()
+
+    def update_uplink(level):
+        if not client.is_connected() or not start_subscriptions(client, level): return False
+        return subscriptions_done.wait(10) and client._transport_verified and not STOP.is_set()
+
+    client._update_uplink_qos = update_uplink
 
     def on_message(_client, _userdata, msg):
         try:
             if msg.topic.endswith("/control-ack"):
-                if not forward_local_control_ack(settings, cloud_client, msg):
+                if not forward_local_control_ack(settings, cloud_client, msg, transport_verified=_client._transport_verified):
                     print("[LOCAL MQTT] rejected invalid WROVER control acknowledgement")
             else:
                 forward_local_message(settings, cloud_client, msg, policy,transport_verified=_client._transport_verified)
@@ -357,7 +446,7 @@ def connect_local_mqtt(client,settings):
     client.connect(settings.local_mqtt_host,settings.local_mqtt_port,keepalive=60,clean_start=False,properties=properties)
 
 
-def make_mqtt_client(settings, apply_configuration=None, relay_control=None, relay_ada031_control=None, apply_connectivity=None, probe_connectivity=None):
+def make_mqtt_client(settings, apply_configuration=None, relay_control=None, relay_ada031_control=None, apply_connectivity=None, probe_connectivity=None, relay_qos=None):
     client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
                          client_id=settings.mqtt_client_id, clean_session=False)
     if settings.mqtt_username:
@@ -376,13 +465,83 @@ def make_mqtt_client(settings, apply_configuration=None, relay_control=None, rel
             result[key] = value
         return result
 
+    cloud_subscriptions = {}
+    cloud_subscription_lock = Lock()
+
+    def start_downlink(level, completion=None):
+        if not client.is_connected(): return False
+        with cloud_subscription_lock:
+            result, mid = client.subscribe(expected_topic, qos=level)
+            if result != mqtt.MQTT_ERR_SUCCESS: return False
+            cloud_subscriptions[mid] = (level, completion)
+        return True
+
+    def update_downlink(level):
+        completion = {"event": Event(), "granted": False}
+        if not start_downlink(level, completion): return False
+        return completion["event"].wait(10) and completion["granted"] and client.is_connected()
+
+    client._update_downlink_qos = update_downlink
+
+    def on_subscribe(_client, _userdata, mid, reason_codes, _properties=None):
+        with cloud_subscription_lock:
+            entry = cloud_subscriptions.pop(mid, None)
+            valid = entry is not None and len(reason_codes) == 1 and not getattr(reason_codes[0], "is_failure", False) and getattr(reason_codes[0], "value", None) == entry[0]
+            if entry is not None and entry[1] is not None:
+                entry[1]["granted"] = valid
+                entry[1]["event"].set()
+            if not valid:
+                print("[MQTT] Broker did not grant the requested command subscription")
+                INGRESS_FAILED.set(); STOP.set()
+
+    def on_disconnect(_client, *_args):
+        with cloud_subscription_lock:
+            for _, completion in cloud_subscriptions.values():
+                if completion is not None: completion["event"].set()
+            cloud_subscriptions.clear()
+
     def on_connect(_client, _userdata, _flags, rc, _properties=None):
         if rc == 0:
             print("[MQTT] connected")
-            _client.subscribe(expected_topic, qos=1)
-            _client.subscribe(connectivity_topic, qos=1)
+            if not start_downlink(getattr(settings, "mqtt_downlink_qos", 1)):
+                INGRESS_FAILED.set(); STOP.set(); return
+            with cloud_subscription_lock:
+                result, mid = _client.subscribe(connectivity_topic, qos=1)
+                if result != mqtt.MQTT_ERR_SUCCESS:
+                    INGRESS_FAILED.set(); STOP.set(); return
+                cloud_subscriptions[mid] = (1, None)
         else:
             print(f"[MQTT] connect failed rc={rc}")
+
+    qos_request_lock = Lock()
+    qos_threads = []
+
+    def queue_qos_request(command):
+        validate_qos_configuration(settings, command)
+        if relay_qos is None or not qos_request_lock.acquire(blocking=False):
+            raise ValueError("QoS configuration is unavailable or already in progress")
+        def run_request():
+            try:
+                relay_qos(command)
+            except Exception as error:
+                receipt = {"deviceId": settings.device_id, "gatewayDeviceId": settings.device_id, "targetDeviceId": command["targetDeviceId"],
+                           "action": "configure_mqtt_qos", "commandId": command["commandId"], "revision": command["revision"],
+                           "status": "rejected", "timestamp": int(time.time() * 1000), "reason": str(error)[:128]}
+                client.publish(expected_topic + "/ack", json.dumps(receipt), qos=1, retain=False)
+            finally:
+                qos_request_lock.release()
+        worker = Thread(target=run_request, daemon=True)
+        qos_threads[:] = [thread for thread in qos_threads if thread.is_alive()]
+        qos_threads.append(worker)
+        try:
+            worker.start()
+        except Exception:
+            qos_threads.remove(worker)
+            qos_request_lock.release()
+            raise
+        return {"commandId": command["commandId"], "targetDeviceId": command["targetDeviceId"], "status": "queued"}
+
+    client._qos_threads = qos_threads
 
     def on_message(_client, _userdata, msg):
         ack = {"deviceId": settings.device_id, "status": "rejected", "timestamp": int(time.time() * 1000)}
@@ -414,6 +573,13 @@ def make_mqtt_client(settings, apply_configuration=None, relay_control=None, rel
                     raise ValueError("Connectivity probes require a live non-retained request")
                 ack.update(probe_connectivity(command))
                 ack["action"] = "probe_connectivity"
+            elif command.get("action") == "configure_mqtt_qos":
+                ack.update(action="configure_mqtt_qos", commandId=command.get("commandId"), gatewayDeviceId=settings.device_id,
+                           targetDeviceId=command.get("targetDeviceId"), revision=command.get("revision"))
+                if getattr(msg, "retain", False) or relay_qos is None:
+                    raise ValueError("QoS configuration requires a live non-retained request")
+                ack.update(queue_qos_request(command))
+                ack.update(status="queued", action="configure_mqtt_qos")
             elif command.get("action") == "set_gpio":
                 if getattr(msg, "retain", False):
                     raise ValueError("GPIO control messages must not be retained")
@@ -431,12 +597,14 @@ def make_mqtt_client(settings, apply_configuration=None, relay_control=None, rel
             else:
                 raise ValueError("Command action is not supported")
         except Exception as exc:
-            ack["reason"] = str(exc)[:160]
+            ack["reason"] = str(exc)[:128]
             print(f"[MQTT] rejected edge configuration: {exc}")
         ack_topic = expected_topic + "/ack"
         _client.publish(ack_topic, json.dumps(ack), qos=1, retain=False)
 
     client.on_connect = on_connect
+    client.on_subscribe = on_subscribe
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
     return client
 
@@ -585,7 +753,7 @@ def heartbeat_loop(settings, client):
         }
         # Current liveness is ephemeral: do not spool old heartbeats for replay.
         if client.is_connected():
-            client.publish(heartbeat_topic(settings.site_id, settings.line_id, settings.device_id), json.dumps(payload, separators=(",", ":")), qos=1)
+            client.publish(heartbeat_topic(settings.site_id, settings.line_id, settings.device_id), json.dumps(payload, separators=(",", ":")), qos=getattr(settings, "mqtt_uplink_qos", 1))
         STOP.wait(getattr(settings, "heartbeat_interval_seconds", 60))
 
 
@@ -602,6 +770,9 @@ def main():
     serial_io_lock = Lock()
     state_dir = getattr(settings, "state_dir", "")
     state = DurableState(str(__import__('pathlib').Path(state_dir) / "delivery.sqlite3"), getattr(settings, "max_queued_messages", 50000)) if state_dir else None
+    saved_qos = state.qos_policy() if state else None
+    if saved_qos:
+        _, settings.mqtt_uplink_qos, settings.mqtt_downlink_qos = saved_qos
     security_collector=SecurityCollector.from_environment(state)
     settings._security_collector=security_collector
     ada031_commands = Ada031SerialCommandManager(command_state=state)
@@ -664,7 +835,7 @@ def main():
             raise ValueError("Connectivity runtime is unavailable")
         return connectivity_runtime.queue_probe(command)
 
-    client = make_mqtt_client(settings, apply_configuration, relay_control, relay_ada031_control, apply_connectivity, probe_connectivity)
+    client = make_mqtt_client(settings, apply_configuration, relay_control, relay_ada031_control, apply_connectivity, probe_connectivity, relay_qos=lambda command: apply_gateway_qos(settings, state, client, local_client, command))
     publisher = DurablePublisher(client, state) if state else client
     if security_collector:
         Thread(target=security_collector.run,args=(STOP,client),daemon=True).start()
@@ -693,7 +864,7 @@ def main():
         if isinstance(data.get("connectivity"), dict):
             payload["connectivity"] = data["connectivity"]
         topic = telemetry_topic(settings.site_id, settings.line_id, settings.device_id)
-        result = publisher.publish(topic, json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False), qos=1)
+        result = publisher.publish(topic, json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False), qos=getattr(settings, "mqtt_uplink_qos", 1))
         if getattr(result, "rc", 0) != 0:
             if "connectivity" in payload:
                 raise RuntimeError("connectivity_delivery_unavailable")
@@ -788,7 +959,7 @@ def main():
     # still be finishing a bounded serial/protocol read when SIGTERM arrives.
     client.loop_stop()
     client.disconnect()
-    workers = [serial_thread, asset_thread, hb_thread]
+    workers = [serial_thread, asset_thread, hb_thread, *getattr(client, "_qos_threads", [])]
     if connectivity_thread is not None:
         workers.append(connectivity_thread)
     if delivery_thread is not None:

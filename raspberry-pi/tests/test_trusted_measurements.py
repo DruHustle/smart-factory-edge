@@ -36,6 +36,12 @@ class TrustedMeasurementTests(unittest.TestCase):
   msg=types.SimpleNamespace(topic=telemetry_topic('fixture','line','sensor.temp:01'),payload=json.dumps(record).encode(),retain=True)
   self.assertTrue(forward_local_message(settings,publisher,msg));received=output[0]
   self.assertEqual(received['timestamp'],record['timestamp']);self.assertEqual(received['integration']['mode'],'live');self.assertEqual(received['integration']['sessionId'],'boot-123');self.assertTrue(received['transportRetained']);self.assertTrue(received['integration']['retained']);self.assertEqual(received['units'],record['units'])
+ def test_validated_sensor_observation_uses_configured_uplink_qos(self):
+  for qos in (0,1,2):
+   settings=types.SimpleNamespace(device_id='gateway',site_id='fixture',line_id='line',local_mqtt_device_ids=('sensor',),mqtt_uplink_qos=qos)
+   output=[];publisher=types.SimpleNamespace(publish=lambda topic,payload,**kwargs:output.append(kwargs) or types.SimpleNamespace(rc=0))
+   msg=types.SimpleNamespace(topic=telemetry_topic('fixture','line','sensor'),payload=json.dumps({'deviceId':'sensor','timestamp':1793066400000,'temperature':23}).encode(),retain=False)
+   self.assertTrue(forward_local_message(settings,publisher,msg));self.assertEqual(output[0]['qos'],qos)
  def test_legacy_input_is_not_relabelled_as_verified_live(self):
   settings=types.SimpleNamespace(device_id='gateway',site_id='fixture',line_id='line',local_mqtt_device_ids=('sensor',))
   output=[];publisher=types.SimpleNamespace(publish=lambda topic,payload,**kwargs:output.append(json.loads(payload)) or types.SimpleNamespace(rc=0))
