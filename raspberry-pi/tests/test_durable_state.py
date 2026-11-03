@@ -8,6 +8,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from durable_state import DurableState, DurablePublisher
 
 class DurableStateTests(unittest.TestCase):
+    def test_gateway_qos_policy_is_durable_and_rejects_stale_revisions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.sqlite3")
+            state = DurableState(path)
+            self.assertIsNone(state.qos_policy())
+            state.save_qos_policy(3, 2, 0)
+            state.close()
+            state = DurableState(path)
+            self.assertEqual(state.qos_policy(), (3, 2, 0))
+            state.save_qos_policy(3, 2, 0)
+            for values in ((2, 1, 1), (3, 1, 1), (4, 3, 1), (4, True, 1)):
+                with self.assertRaises(ValueError): state.save_qos_policy(*values)
+            self.assertEqual(state.qos_policy(), (3, 2, 0))
+            state.close()
+
     def test_qos_is_recorded_per_message_and_survives_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "state.sqlite3")

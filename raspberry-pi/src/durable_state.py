@@ -26,6 +26,7 @@ class DurableState:
         self._db.execute("DELETE FROM telemetry_qos WHERE NOT EXISTS (SELECT 1 FROM telemetry WHERE telemetry.id=telemetry_qos.id AND telemetry.queued_at=telemetry_qos.queued_at)")
         self._db.execute("CREATE INDEX IF NOT EXISTS telemetry_queue_order ON telemetry (queued_at)")
         self._db.execute("CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, expires_at REAL NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS mqtt_qos_policy (singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL, uplink INTEGER NOT NULL, downlink INTEGER NOT NULL)")
         self._db.commit()
 
     def enqueue(self, topic: str, payload: str, qos: int = 1) -> str:
@@ -59,6 +60,19 @@ class DurableState:
         with self._lock, self._db:
             self._db.execute("DELETE FROM telemetry WHERE id=?", (identity,))
             self._db.execute("DELETE FROM telemetry_qos WHERE id=?", (identity,))
+
+    def qos_policy(self):
+        with self._lock:
+            return self._db.execute("SELECT revision, uplink, downlink FROM mqtt_qos_policy WHERE singleton=1").fetchone()
+
+    def save_qos_policy(self, revision: int, uplink: int, downlink: int):
+        if type(revision) is not int or not 1 <= revision <= 0xffffffff or any(type(v) is not int or v not in (0, 1, 2) for v in (uplink, downlink)):
+            raise ValueError("Invalid MQTT QoS policy")
+        with self._lock, self._db:
+            previous = self._db.execute("SELECT revision, uplink, downlink FROM mqtt_qos_policy WHERE singleton=1").fetchone()
+            if previous and (revision < previous[0] or (revision == previous[0] and previous[1:] != (uplink, downlink))):
+                raise ValueError("MQTT QoS revision is stale or conflicts")
+            self._db.execute("INSERT INTO mqtt_qos_policy VALUES (1, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,uplink=excluded.uplink,downlink=excluded.downlink", (revision, uplink, downlink))
 
     def reserve_command(self, identity: str, expires_at_ms: int) -> bool:
         # Reserve before the physical write. A crash cannot turn MQTT replay into

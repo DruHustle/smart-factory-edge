@@ -67,6 +67,9 @@ class FakeMqttClient:
         self.disconnected = False
         self.acknowledged = []
 
+    def is_connected(self):
+        return True
+
     def ack(self, mid, qos):
         self.acknowledged.append((mid, qos))
         return 0
@@ -307,18 +310,43 @@ class GatewaySmokeTests(unittest.TestCase):
                 sensor_gateway.relay_qos_configuration(settings, client, {**command, field: invalid})
         self.assertEqual(len(client.published), 1)
 
+    def test_gateway_qos_change_fails_closed_before_persisting_ungranted_levels(self):
+        sensor_gateway = importlib.import_module("sensor_gateway")
+        from durable_state import DurableState
+        settings = types.SimpleNamespace(site_id="site", line_id="line", local_mqtt_device_ids=("wrover",),
+            local_mqtt_control_device_ids=("wrover",), mqtt_uplink_qos=1, mqtt_downlink_qos=1)
+        command = {"schemaVersion": 1, "action": "configure_mqtt_qos", "commandId": "qos-test-0001", "targetDeviceId": "wrover", "revision": 2, "uplinkQos": 2, "downlinkQos": 0, "expiresAt": int(sensor_gateway.time.time()*1000)+5000}
+        with tempfile.TemporaryDirectory() as directory:
+            state = DurableState(str(Path(directory) / "state.sqlite3"))
+            state.save_qos_policy(1, 1, 1)
+            local = FakeMqttClient()
+            local._update_uplink_qos = lambda _qos: True
+            cloud = FakeMqttClient()
+            cloud._update_downlink_qos = lambda _qos: False
+            try:
+                with self.assertRaisesRegex(RuntimeError, "Cloud broker"):
+                    sensor_gateway.apply_gateway_qos(settings, state, cloud, local, command)
+                self.assertEqual(state.qos_policy(), (1, 1, 1))
+                self.assertEqual((settings.mqtt_uplink_qos, settings.mqtt_downlink_qos), (1, 1))
+                self.assertEqual(local.published, [])
+                self.assertTrue(sensor_gateway.STOP.is_set())
+            finally:
+                sensor_gateway.STOP.clear(); sensor_gateway.INGRESS_FAILED.clear(); state.close()
+
     def test_cloud_qos_request_rejects_retained_messages_and_reports_queued(self):
         sensor_gateway = importlib.import_module("sensor_gateway")
         settings = types.SimpleNamespace(mqtt_client_id="gateway", mqtt_username="", mqtt_password="", mqtt_use_tls=False,
-            mqtt_ca_cert="", site_id="site", line_id="line", device_id="gateway")
+            mqtt_ca_cert="", site_id="site", line_id="line", device_id="gateway",
+            local_mqtt_device_ids=("wrover",), local_mqtt_control_device_ids=("wrover",))
         forwarded = []
         client = sensor_gateway.make_mqtt_client(settings, relay_qos=lambda value: forwarded.append(value) or {"commandId": value["commandId"]})
-        command = {"action": "configure_mqtt_qos", "commandId": "qos-test-0001"}
+        command = {"schemaVersion": 1, "action": "configure_mqtt_qos", "commandId": "qos-test-0001", "targetDeviceId": "wrover", "revision": 1, "uplinkQos": 2, "downlinkQos": 0, "expiresAt": int(sensor_gateway.time.time() * 1000) + 5000}
         topic = sensor_gateway.command_topic("site", "line", "gateway")
         client.on_message(client, None, types.SimpleNamespace(topic=topic, payload=json.dumps(command).encode(), retain=True))
         self.assertEqual(forwarded, [])
         self.assertEqual(json.loads(client.published[-1][1])["status"], "rejected")
         client.on_message(client, None, types.SimpleNamespace(topic=topic, payload=json.dumps(command).encode(), retain=False))
+        client._qos_threads[-1].join(timeout=2)
         self.assertEqual(forwarded, [command])
         self.assertEqual(json.loads(client.published[-1][1])["status"], "queued")
 
@@ -327,7 +355,7 @@ class GatewaySmokeTests(unittest.TestCase):
         settings = types.SimpleNamespace(site_id="site", line_id="line", device_id="gateway",
             local_mqtt_control_device_ids=("wrover",))
         ack = {"action": "configure_mqtt_qos", "deviceId": "wrover", "commandId": "qos-test-0001",
-               "status": "applied", "timestamp": 1700000000000, "revision": 7, "uplinkQos": 2, "downlinkQos": 0}
+               "status": "applied", "timestamp": 1700000000000, "revision": 7, "requestedRevision": 7, "uplinkQos": 2, "downlinkQos": 0}
         client = FakeMqttClient()
         def message(value, retained=False):
             return types.SimpleNamespace(topic="factory/site/line/wrover/control-ack", payload=json.dumps(value).encode(), retain=retained)
