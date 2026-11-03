@@ -19,11 +19,16 @@ class DurableState:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.execute("CREATE TABLE IF NOT EXISTS telemetry (id TEXT PRIMARY KEY, topic TEXT NOT NULL, payload TEXT NOT NULL, queued_at REAL NOT NULL)")
+        # Separate metadata preserves compatibility with the previous release's
+        # four-column telemetry table and its rollback INSERT statements.
+        self._db.execute("CREATE TABLE IF NOT EXISTS telemetry_qos (id TEXT PRIMARY KEY, queued_at REAL NOT NULL, qos INTEGER NOT NULL CHECK(qos BETWEEN 0 AND 2))")
         self._db.execute("CREATE INDEX IF NOT EXISTS telemetry_queue_order ON telemetry (queued_at)")
         self._db.execute("CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, expires_at REAL NOT NULL)")
         self._db.commit()
 
-    def enqueue(self, topic: str, payload: str) -> str:
+    def enqueue(self, topic: str, payload: str, qos: int = 1) -> str:
+        if type(qos) is not int or qos not in (0, 1, 2):
+            raise ValueError("MQTT QoS must be 0, 1, or 2")
         if len(payload.encode('utf-8')) > 16384:
             raise ValueError("Telemetry exceeds the 16 KiB delivery limit")
         identity = hashlib.sha256((topic + "\n" + payload).encode('utf-8')).hexdigest()
@@ -32,16 +37,26 @@ class DurableState:
                 return identity
             if self._db.execute("SELECT count(*) FROM telemetry").fetchone()[0] >= self.max_messages:
                 raise RuntimeError("Durable telemetry queue is full; restore uplink connectivity")
-            self._db.execute("INSERT INTO telemetry VALUES (?, ?, ?, ?)", (identity, topic, payload, time.time()))
+            queued_at = time.time()
+            self._db.execute("INSERT INTO telemetry VALUES (?, ?, ?, ?)", (identity, topic, payload, queued_at))
+            self._db.execute("INSERT OR REPLACE INTO telemetry_qos VALUES (?, ?, ?)", (identity, queued_at, qos))
         return identity
 
     def first(self):
         with self._lock:
             return self._db.execute("SELECT id, topic, payload FROM telemetry ORDER BY queued_at, rowid LIMIT 1").fetchone()
 
+    def first_with_qos(self):
+        with self._lock:
+            # A rollback can delete and reinsert an identical payload without
+            # knowing about the metadata table. Match the original queue time
+            # so that stale metadata can never change that legacy row's QoS.
+            return self._db.execute("SELECT t.id, t.topic, t.payload, COALESCE(q.qos, 1) FROM telemetry t LEFT JOIN telemetry_qos q ON q.id=t.id AND q.queued_at=t.queued_at ORDER BY t.queued_at, t.rowid LIMIT 1").fetchone()
+
     def delivered(self, identity: str):
         with self._lock, self._db:
             self._db.execute("DELETE FROM telemetry WHERE id=?", (identity,))
+            self._db.execute("DELETE FROM telemetry_qos WHERE id=?", (identity,))
 
     def reserve_command(self, identity: str, expires_at_ms: int) -> bool:
         # Reserve before the physical write. A crash cannot turn MQTT replay into
@@ -61,20 +76,20 @@ class DurablePublisher:
         self.state = state
 
     def publish(self, topic, payload, qos=1, retain=False):
-        if retain or qos != 1:
-            raise ValueError("Durable delivery accepts only non-retained QoS 1 telemetry")
+        if retain or type(qos) is not int or qos not in (0, 1, 2):
+            raise ValueError("Delivery accepts non-retained MQTT QoS 0, 1, or 2")
         try:
-            self.state.enqueue(topic, payload)
+            self.state.enqueue(topic, payload, qos)
             return SimpleNamespace(rc=0)
         except (RuntimeError, OSError, sqlite3.Error) as error:
             print(f"[DELIVERY] {error}")
             return SimpleNamespace(rc=1)
 
     def drain_one(self) -> bool:
-        item = self.state.first()
+        item = self.state.first_with_qos()
         if item is None or not self.client.is_connected():
             return False
-        identity, topic, payload = item
+        identity, topic, payload, qos = item
         if topic.startswith("factory/"):
             from mqtt_topics import decode_level,topic as encoded_topic
             parts=topic.split("/")
@@ -83,10 +98,12 @@ class DurablePublisher:
                 except ValueError:
                     print("[DELIVERY] Queued topic requires identity/route review; evidence retained")
                     return False
-        message = self.client.publish(topic, payload, qos=1, retain=False)
+        message = self.client.publish(topic, payload, qos=qos, retain=False)
         if message.rc != 0:
             return False
         try:
+            # Paho confirms a socket write for QoS 0, PUBACK for QoS 1 and
+            # PUBCOMP for QoS 2. QoS 0 therefore cannot prove broker receipt.
             message.wait_for_publish(timeout=5)
             if not message.is_published():
                 return False
