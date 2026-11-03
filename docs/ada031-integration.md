@@ -109,7 +109,7 @@ Ensure the `smartfactory` account can access that device (usually through `dialo
 ADA031_CONTROL_ASSET_IDS=urn:smart-factory:asset:replace-with-exact-id
 ```
 
-Keep the CloudAMQP credential on the gateway service only. The Arduino controller receives a physical USB serial connection; it never receives Wi-Fi credentials, MQTT credentials, or the service token.
+Keep the cloud broker credential on the gateway service only. The Arduino controller receives a physical USB serial connection; it never receives Wi-Fi credentials, MQTT credentials, or the service token.
 
 Check the gateway logs after enabling the asset and restarting the service:
 

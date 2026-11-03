@@ -1,6 +1,6 @@
 # ESP32 WROVER Firmware
 
-The WROVER publishes physical DHT11 temperature, relative humidity, and button state to the Pi's local Mosquitto broker over MQTT/TLS. GPIO18 remains an allowlisted digital control output; GPIO19 is dedicated to the button-state LED. It does not connect to CloudAMQP, the application database, Redis, or the internet; the Pi validates and forwards telemetry and relays short-lived output requests. For provider-side TLS guidance see [CloudAMQP MQTT setup](https://www.cloudamqp.com/docs/mqtt.html).
+The WROVER publishes physical DHT11 temperature, relative humidity, and button state to the Pi's local Mosquitto broker over MQTT/TLS. GPIO18 remains an allowlisted digital control output; GPIO19 is dedicated to the button-state LED. It does not connect to the cloud broker, application database, Redis, or the internet; the Pi validates and forwards telemetry and relays short-lived output requests.
 
 ## Configure, build, and upload
 
@@ -10,7 +10,7 @@ Install PlatformIO Core or its VS Code extension and the Espressif32 platform. C
 cp include/config.example.h include/smart_factory_config.h
 ```
 
-Edit the ignored `include/smart_factory_config.h` with the OT Wi-Fi SSID/password, the Pi gateway mDNS name (`smart-factory-gateway.local`) and TLS listener port (`8883`), a unique Mosquitto user/password, the CA that signed the Pi broker certificate, and the gateway-provided NTP server. The firmware resolves `.local` names through mDNS for both NTP and MQTT; TLS still checks the original `MQTT_HOST` against a DNS Subject Alternative Name on the Pi broker certificate. The ESP32 must be on a LAN that forwards mDNS multicast and allows local client-to-client traffic. Keep WROVER credentials separate from the Pi's CloudAMQP credentials. GPIO18 defaults LOW as the startup and timeout-safe control level. Confirm the connected driver treats LOW as its safe state before enabling remote control; otherwise set `CONTROL_GPIO_SAFE_LEVEL` to the verified safe level in the ignored config.
+Edit the ignored `include/smart_factory_config.h` with the OT Wi-Fi SSID/password, the Pi gateway mDNS name (`smart-factory-gateway.local`) and TLS listener port (`8883`), a unique Mosquitto user/password, the CA that signed the Pi broker certificate, and the gateway-provided NTP server. The firmware resolves `.local` names through mDNS for both NTP and MQTT; TLS still checks the original `MQTT_HOST` against a DNS Subject Alternative Name on the Pi broker certificate. The ESP32 must be on a LAN that forwards mDNS multicast and allows local client-to-client traffic. Keep WROVER credentials separate from the Pi's cloud broker credentials. GPIO18 defaults LOW as the startup and timeout-safe control level. Confirm the connected driver treats LOW as its safe state before enabling remote control; otherwise set `CONTROL_GPIO_SAFE_LEVEL` to the verified safe level in the ignored config.
 
 ```bash
 pio run
@@ -63,4 +63,4 @@ The DHT11 is a basic, uncalibrated bench sensor and must not be used as a proces
 
 ## Raspberry Pi setup reference
 
-Configure Mosquitto TLS, per-device ACLs, CloudAMQP uplink credentials, and the Python allowlist on the Pi first. Follow the [Raspberry Pi gateway guide](../raspberry-pi/README.md#configure-local-mosquitto-ingress-for-wrover) before flashing this firmware.
+Configure Mosquitto TLS, per-device ACLs, cloud broker uplink credentials, and the Python allowlist on the Pi first. Follow the [Raspberry Pi gateway guide](../raspberry-pi/README.md#configure-local-mosquitto-ingress-for-wrover) before flashing this firmware.
