@@ -200,7 +200,7 @@ class GatewaySmokeTests(unittest.TestCase):
 
         sensor_gateway.load_settings = lambda: settings
         sensor_gateway.load_asset_connections = lambda _path, _gateway_id=None: asset_configs or []
-        sensor_gateway.make_mqtt_client = lambda _settings, *_args: fake_client
+        sensor_gateway.make_mqtt_client = lambda _settings, *_args, **_kwargs: fake_client
         sensor_gateway.serial_reader = lambda *_args, **_kwargs: None
         sensor_gateway.heartbeat_loop = lambda *_args, **_kwargs: None
         sensor_gateway.signal.signal = lambda *_args, **_kwargs: None
@@ -288,6 +288,54 @@ class GatewaySmokeTests(unittest.TestCase):
         client.on_message(client, None, types.SimpleNamespace(topic=topic, payload=json.dumps(command).encode(), retain=False))
         self.assertEqual(relayed, [command])
         self.assertEqual(json.loads(client.published[-1][1])["status"], "serial_write_accepted")
+
+    def test_qos_configuration_relay_is_scoped_and_non_retained(self):
+        sensor_gateway = importlib.import_module("sensor_gateway")
+        settings = types.SimpleNamespace(site_id="site", line_id="line", local_mqtt_device_ids=("wrover",),
+            local_mqtt_control_device_ids=("wrover",))
+        now = int(sensor_gateway.time.time() * 1000)
+        command = {"schemaVersion": 1, "action": "configure_mqtt_qos", "commandId": "qos-test-0001",
+            "targetDeviceId": "wrover", "revision": 7, "uplinkQos": 2, "downlinkQos": 0, "expiresAt": now + 5000}
+        client = FakeMqttClient()
+        result = sensor_gateway.relay_qos_configuration(settings, client, command)
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(client.published[0][2:], (1, False))
+        self.assertNotIn("targetDeviceId", json.loads(client.published[0][1]))
+        for field, invalid in (("targetDeviceId", "other"), ("uplinkQos", True), ("downlinkQos", 3),
+                               ("revision", 0), ("expiresAt", now - 1), ("schemaVersion", True)):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                sensor_gateway.relay_qos_configuration(settings, client, {**command, field: invalid})
+        self.assertEqual(len(client.published), 1)
+
+    def test_cloud_qos_request_rejects_retained_messages_and_reports_queued(self):
+        sensor_gateway = importlib.import_module("sensor_gateway")
+        settings = types.SimpleNamespace(mqtt_client_id="gateway", mqtt_username="", mqtt_password="", mqtt_use_tls=False,
+            mqtt_ca_cert="", site_id="site", line_id="line", device_id="gateway")
+        forwarded = []
+        client = sensor_gateway.make_mqtt_client(settings, relay_qos=lambda value: forwarded.append(value) or {"commandId": value["commandId"]})
+        command = {"action": "configure_mqtt_qos", "commandId": "qos-test-0001"}
+        topic = sensor_gateway.command_topic("site", "line", "gateway")
+        client.on_message(client, None, types.SimpleNamespace(topic=topic, payload=json.dumps(command).encode(), retain=True))
+        self.assertEqual(forwarded, [])
+        self.assertEqual(json.loads(client.published[-1][1])["status"], "rejected")
+        client.on_message(client, None, types.SimpleNamespace(topic=topic, payload=json.dumps(command).encode(), retain=False))
+        self.assertEqual(forwarded, [command])
+        self.assertEqual(json.loads(client.published[-1][1])["status"], "queued")
+
+    def test_qos_ack_requires_scoped_identity_valid_revision_and_no_retention(self):
+        sensor_gateway = importlib.import_module("sensor_gateway")
+        settings = types.SimpleNamespace(site_id="site", line_id="line", device_id="gateway",
+            local_mqtt_control_device_ids=("wrover",))
+        ack = {"action": "configure_mqtt_qos", "deviceId": "wrover", "commandId": "qos-test-0001",
+               "status": "applied", "timestamp": 1700000000000, "revision": 7, "uplinkQos": 2, "downlinkQos": 0}
+        client = FakeMqttClient()
+        def message(value, retained=False):
+            return types.SimpleNamespace(topic="factory/site/line/wrover/control-ack", payload=json.dumps(value).encode(), retain=retained)
+        self.assertTrue(sensor_gateway.forward_local_control_ack(settings, client, message(ack)))
+        self.assertFalse(sensor_gateway.forward_local_control_ack(settings, client, message(ack, True)))
+        for field, invalid in (("revision", True), ("uplinkQos", 3), ("deviceId", "other")):
+            self.assertFalse(sensor_gateway.forward_local_control_ack(settings, client, message({**ack, field: invalid})))
+        self.assertEqual(len(client.published), 1)
 
     def test_wrover_relay_uses_configured_downlink_qos(self):
         sensor_gateway = importlib.import_module("sensor_gateway")

@@ -249,6 +249,31 @@ def relay_gpio_command(settings, local_client, command: dict) -> dict:
     return {"commandId": command["commandId"], "targetDeviceId": target, "status": "queued"}
 
 
+def relay_qos_configuration(settings, local_client, command: dict) -> dict:
+    """Send a bounded, non-retained settings request to an allowlisted WROVER."""
+    required = {"schemaVersion", "action", "commandId", "targetDeviceId", "revision", "uplinkQos", "downlinkQos", "expiresAt"}
+    if not isinstance(command, dict) or set(command) != required or type(command.get("schemaVersion")) is not int or command.get("schemaVersion") != 1 or command.get("action") != "configure_mqtt_qos":
+        raise ValueError("MQTT QoS configuration fields are invalid")
+    target, identity = command.get("targetDeviceId"), command.get("commandId")
+    if target not in set(getattr(settings, "local_mqtt_control_device_ids", ())) or target not in set(settings.local_mqtt_device_ids):
+        raise ValueError("Target WROVER is not enabled for control")
+    if not isinstance(identity, str) or not 8 <= len(identity) <= 64 or not all((c.isascii() and c.isalnum()) or c in "-_." for c in identity):
+        raise ValueError("QoS command ID is invalid")
+    for field in ("uplinkQos", "downlinkQos"):
+        if type(command[field]) is not int or command[field] not in (0, 1, 2):
+            raise ValueError("MQTT QoS must be 0, 1, or 2")
+    if type(command["revision"]) is not int or not 1 <= command["revision"] <= 0xffffffff:
+        raise ValueError("MQTT QoS revision is invalid")
+    now = int(time.time() * 1000)
+    if type(command["expiresAt"]) is not int or not now < command["expiresAt"] <= now + 30000:
+        raise ValueError("MQTT QoS command has expired or has an invalid expiry")
+    local_command = {key: value for key, value in command.items() if key != "targetDeviceId"}
+    result = local_client.publish(command_topic(settings.site_id, settings.line_id, target), json.dumps(local_command), qos=1, retain=False)
+    if getattr(result, "rc", 0) != getattr(mqtt, "MQTT_ERR_SUCCESS", 0):
+        raise RuntimeError("Pi-local MQTT broker rejected the QoS request")
+    return {"commandId": identity, "targetDeviceId": target, "status": "queued"}
+
+
 def forward_local_control_ack(settings, cloud_client, msg) -> bool:
     """Forward a WROVER acknowledgement to the gateway's scoped cloud ack topic."""
     parts = msg.topic.split("/")
@@ -274,6 +299,16 @@ def forward_local_control_ack(settings, cloud_client, msg) -> bool:
         return False
     if ack.get("status") not in {"applied", "rejected", "duplicate_ignored"}:
         return False
+    if ack.get("action") == "configure_mqtt_qos":
+        required = {"action", "deviceId", "commandId", "status", "timestamp", "revision", "uplinkQos", "downlinkQos"}
+        if getattr(msg, "retain", False) or not required.issubset(ack) or set(ack) - required - {"reason"}:
+            return False
+        if type(ack["revision"]) is not int or not 0 <= ack["revision"] <= 0xffffffff:
+            return False
+        if any(type(ack[key]) is not int or ack[key] not in (0, 1, 2) for key in ("uplinkQos", "downlinkQos")):
+            return False
+        if ack["status"] not in {"applied", "rejected"} or ("reason" in ack and (not isinstance(ack["reason"], str) or len(ack["reason"]) > 128)):
+            return False
     pin = ack.get("pin")
     if pin is not None and (isinstance(pin, bool) or not isinstance(pin, int) or pin not in WROVER_CONTROL_PINS):
         return False
@@ -357,7 +392,7 @@ def connect_local_mqtt(client,settings):
     client.connect(settings.local_mqtt_host,settings.local_mqtt_port,keepalive=60,clean_start=False,properties=properties)
 
 
-def make_mqtt_client(settings, apply_configuration=None, relay_control=None, relay_ada031_control=None, apply_connectivity=None, probe_connectivity=None):
+def make_mqtt_client(settings, apply_configuration=None, relay_control=None, relay_ada031_control=None, apply_connectivity=None, probe_connectivity=None, relay_qos=None):
     client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
                          client_id=settings.mqtt_client_id, clean_session=False)
     if settings.mqtt_username:
@@ -414,6 +449,11 @@ def make_mqtt_client(settings, apply_configuration=None, relay_control=None, rel
                     raise ValueError("Connectivity probes require a live non-retained request")
                 ack.update(probe_connectivity(command))
                 ack["action"] = "probe_connectivity"
+            elif command.get("action") == "configure_mqtt_qos":
+                if getattr(msg, "retain", False) or relay_qos is None:
+                    raise ValueError("QoS configuration requires a live non-retained request")
+                ack.update(relay_qos(command))
+                ack.update(status="queued", action="configure_mqtt_qos")
             elif command.get("action") == "set_gpio":
                 if getattr(msg, "retain", False):
                     raise ValueError("GPIO control messages must not be retained")
@@ -664,7 +704,7 @@ def main():
             raise ValueError("Connectivity runtime is unavailable")
         return connectivity_runtime.queue_probe(command)
 
-    client = make_mqtt_client(settings, apply_configuration, relay_control, relay_ada031_control, apply_connectivity, probe_connectivity)
+    client = make_mqtt_client(settings, apply_configuration, relay_control, relay_ada031_control, apply_connectivity, probe_connectivity, relay_qos=lambda command: relay_qos_configuration(settings, local_client, command))
     publisher = DurablePublisher(client, state) if state else client
     if security_collector:
         Thread(target=security_collector.run,args=(STOP,client),daemon=True).start()
