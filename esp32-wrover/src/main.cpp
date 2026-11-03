@@ -308,6 +308,12 @@ void applyPendingQos() {
     return;
   }
   const QosConfiguration previous = qosConfiguration;
+  if (request.value.revision < previous.revision ||
+      (request.value.revision == previous.revision &&
+       (request.value.uplink != previous.uplink || request.value.downlink != previous.downlink))) {
+    publishQosAck(request.commandId, "rejected", "stale_revision");
+    return;
+  }
   if (!mqttClient.subscribe(topicCommands(), request.value.downlink) || mqttClient.subscribeQoS() != request.value.downlink) {
     mqttClient.stop();
     return;
